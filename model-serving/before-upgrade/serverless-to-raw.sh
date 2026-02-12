@@ -343,35 +343,36 @@ check_permissions() {
 list_and_select_inference_services() {
     echo "🔍 Discovering InferenceServices in source namespace '$NAMESPACE'..."
 
-    # Get all InferenceServices in the source namespace
-    local isvc_list=$(oc get inferenceservice -n "$NAMESPACE" -o yaml 2>/dev/null)
-
-    if [[ $? -ne 0 ]]; then
+    # Get all InferenceServices in the source namespace (JSON for reliable jq filtering; avoids yq/jq quoting issues)
+    local isvc_json
+    isvc_json=$(oc get inferenceservice -n "$NAMESPACE" -o json 2>/dev/null) || true
+    if [[ $? -ne 0 || -z "$isvc_json" ]]; then
         log_error "Failed to retrieve InferenceServices from namespace '$NAMESPACE'"
         echo "Please ensure you have access to the namespace and InferenceServices exist."
         exit 1
     fi
 
     # Check if any InferenceServices exist
-    local isvc_count=$(echo "$isvc_list" | yq '.items | length')
-
-    if [[ "$isvc_count" -eq 0 ]]; then
+    local isvc_count
+    isvc_count=$(echo "$isvc_json" | jq -r '.items | length' 2>/dev/null)
+    if [[ ! "$isvc_count" =~ ^[0-9]+$ || "$isvc_count" -eq 0 ]]; then
         log_error "No InferenceServices found in namespace '$NAMESPACE'"
         echo "There are no models to migrate."
         exit 1
     fi
 
     # Get names of InferenceServices that are eligible (Serverless deployment mode)
+    # Use jq --arg to pass names so the value is never embedded in the expression (avoids syntax errors with kislyuk/yq and special characters)
     local isvc_names=()
     while IFS= read -r name; do
         if [[ -n "$name" && "$name" != "null" ]]; then
-            # Check if this InferenceService has Serverless deployment mode
-            local deployment_mode=$(echo "$isvc_list" | yq ".items[] | select(.metadata.name == \"$name\") | .metadata.annotations.\"serving.kserve.io/deploymentMode\" // \"\"")
+            local deployment_mode
+            deployment_mode=$(echo "$isvc_json" | jq -r --arg n "$name" '.items[] | select(.metadata.name == $n) | .metadata.annotations."serving.kserve.io/deploymentMode" // ""' 2>/dev/null)
             if [[ "$deployment_mode" == "Serverless" ]]; then
                 isvc_names+=("$name")
             fi
         fi
-    done < <(echo "$isvc_list" | yq '.items[].metadata.name' 2>/dev/null)
+    done < <(echo "$isvc_json" | jq -r '.items[].metadata.name' 2>/dev/null)
     
     local filtered_count=${#isvc_names[@]}
     
@@ -390,8 +391,9 @@ list_and_select_inference_services() {
     # List each InferenceService with index numbers
     local index=1
     for isvc_name in "${isvc_names[@]}"; do
-        # Get deployment mode for display
-        local deployment_mode=$(echo "$isvc_list" | yq ".items[] | select(.metadata.name == \"$isvc_name\") | .metadata.annotations.\"serving.kserve.io/deploymentMode\" // \"Serverless (default)\"")
+        # Get deployment mode for display (use jq --arg to avoid embedding name in expression)
+        local deployment_mode
+        deployment_mode=$(echo "$isvc_json" | jq -r --arg n "$isvc_name" '.items[] | select(.metadata.name == $n) | .metadata.annotations."serving.kserve.io/deploymentMode" // "Serverless (default)"' 2>/dev/null)
         echo "[$index] $isvc_name (Mode: $deployment_mode)"
         echo ""
         ((index++))

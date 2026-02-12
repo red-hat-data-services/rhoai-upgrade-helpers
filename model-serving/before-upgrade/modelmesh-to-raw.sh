@@ -571,16 +571,19 @@ list_and_select_inference_services() {
     local isvc_count=0
 
     # Get ModelMesh InferenceServices in the source namespace (filter by deploymentMode annotation)
-    if ! local isvc_list=$(oc get inferenceservice -n "$FROM_NS" -o yaml 2>/dev/null | yq '.items |= map(select(.metadata.annotations."serving.kserve.io/deploymentMode" == "ModelMesh"))'); then
+    # Use JSON + jq to avoid yq/jq quoting issues when embedding names (e.g. kislyuk/yq, special chars)
+    local isvc_json
+    isvc_json=$(oc get inferenceservice -n "$FROM_NS" -o json 2>/dev/null | jq '.items |= map(select(.metadata.annotations."serving.kserve.io/deploymentMode" == "ModelMesh"))' 2>/dev/null) || true
+    if [[ $? -ne 0 || -z "$isvc_json" ]]; then
         echo -e "${ERROR_SYMBOL} Failed to retrieve InferenceServices from namespace '$FROM_NS'"
         echo "  📋 Please ensure you have access to the namespace and InferenceServices exist."
         exit 1
     fi
 
     # Check if any InferenceServices exist
-    local isvc_count=$(echo "$isvc_list" | yq '.items | length')
-
-    if [[ "$isvc_count" -eq 0 ]]; then
+    local isvc_count
+    isvc_count=$(echo "$isvc_json" | jq -r '.items | length' 2>/dev/null)
+    if [[ ! "$isvc_count" =~ ^[0-9]+$ || "$isvc_count" -eq 0 ]]; then
         echo -e "${ERROR_SYMBOL} No ModelMesh InferenceServices found in namespace '$FROM_NS'"
         echo "  📭 This script migrates InferenceServices with deploymentMode 'ModelMesh'"
         echo "  💡 Check if you have ModelMesh InferenceServices with:"
@@ -592,7 +595,8 @@ list_and_select_inference_services() {
     echo ""
 
     # Store names in an array for selection
-    local isvc_names=($(echo "$isvc_list" | yq '.items[].metadata.name'))
+    local isvc_names=()
+    while IFS= read -r n; do [[ -n "$n" ]] && isvc_names+=("$n"); done < <(echo "$isvc_json" | jq -r '.items[].metadata.name' 2>/dev/null)
 
     # Calculate pagination
     local total_pages=$(( (isvc_count + PAGE_SIZE - 1) / PAGE_SIZE ))
@@ -611,14 +615,19 @@ list_and_select_inference_services() {
         echo "📦 InferenceServices (Page $current_page/$total_pages, showing items $((start_index + 1))-$((end_index + 1)) of $isvc_count):"
         echo "======================================================================================="
 
-        # Display InferenceServices for current page
+        # Display InferenceServices for current page (use jq --arg to avoid embedding name in expression)
         for (( i=start_index; i<=end_index; i++ )); do
             local isvc_name="${isvc_names[$i]}"
-            local isvc_info=$(echo "$isvc_list" | yq ".items[] | select(.metadata.name == \"$isvc_name\")")
-            local status=$(echo "$isvc_info" | yq '.status.conditions[-1].type // "Unknown"')
-            local runtime=$(echo "$isvc_info" | yq '.spec.predictor.model.runtime // "N/A"')
-            local model_format=$(echo "$isvc_info" | yq '.spec.predictor.model.modelFormat.name // "N/A"')
-            local storage=$(echo "$isvc_info" | yq '.spec.predictor.model.storage.key // .spec.predictor.model.storageUri // "N/A"')
+            local isvc_info
+            isvc_info=$(echo "$isvc_json" | jq -c --arg n "$isvc_name" '.items[] | select(.metadata.name == $n)' 2>/dev/null)
+            local status
+            status=$(echo "$isvc_info" | jq -r '.status.conditions[-1].type // "Unknown"' 2>/dev/null)
+            local runtime
+            runtime=$(echo "$isvc_info" | jq -r '.spec.predictor.model.runtime // "N/A"' 2>/dev/null)
+            local model_format
+            model_format=$(echo "$isvc_info" | jq -r '.spec.predictor.model.modelFormat.name // "N/A"' 2>/dev/null)
+            local storage
+            storage=$(echo "$isvc_info" | jq -r '.spec.predictor.model.storage.key // .spec.predictor.model.storageUri // "N/A"' 2>/dev/null)
 
             echo "[$((i + 1))] Name: $isvc_name"
             echo "    Status: $status"
@@ -1570,9 +1579,11 @@ roleRef:
 
     # Find secrets with type kubernetes.io/service-account-token that match the pattern
     # Pattern: <name_provided_by_user>-<original-serving-runtime-name>-sa
+    # Use jq --arg to pass runtime name safely (no embedding in expression; endswith for literal match)
     echo "🔍 Looking for service account token secrets for original runtime '$original_runtime'..."
-    local sa_token_secrets=$(oc get secrets -n "$FROM_NS" -o yaml 2>/dev/null | \
-        yq '.items[] | select(.type == "kubernetes.io/service-account-token" and (.metadata.name | test(".*-'$original_runtime'-sa$"))) | .metadata.name' 2>/dev/null || echo "")
+    local sa_token_secrets
+    sa_token_secrets=$(oc get secrets -n "$FROM_NS" -o json 2>/dev/null | \
+        jq -r --arg rt "$original_runtime" '.items[] | select(.type == "kubernetes.io/service-account-token" and (.metadata.name | endswith("-" + $rt + "-sa"))) | .metadata.name' 2>/dev/null || echo "")
 
     if [[ -n "$sa_token_secrets" ]]; then
         echo "  📋 Found service account token secrets for '$isvc_name':"
@@ -1948,9 +1959,11 @@ process_inference_services() {
             save_original_resource "rolebinding" "$source_rolebinding_name" "$FROM_NS"
 
             # Backup service account token secrets before they get deleted
+            # Use jq --arg to pass runtime name safely (no embedding in expression; endswith for literal match)
             echo "  🔍 Looking for service account token secrets to backup..."
-            local sa_token_secrets=$(oc get secrets -n "$FROM_NS" -o yaml 2>/dev/null | \
-                yq '.items[] | select(.type == "kubernetes.io/service-account-token" and (.metadata.name | test(".*-'$original_runtime'-sa$"))) | .metadata.name' 2>/dev/null || echo "")
+            local sa_token_secrets
+            sa_token_secrets=$(oc get secrets -n "$FROM_NS" -o json 2>/dev/null | \
+                jq -r --arg rt "$original_runtime" '.items[] | select(.type == "kubernetes.io/service-account-token" and (.metadata.name | endswith("-" + $rt + "-sa"))) | .metadata.name' 2>/dev/null || echo "")
 
             if [[ -n "$sa_token_secrets" ]]; then
                 echo "  📋 Found service account token secrets to backup:"
