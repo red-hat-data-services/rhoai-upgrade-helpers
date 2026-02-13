@@ -45,6 +45,7 @@ Options:
   --name NAME              Notebook name   (required for single-workbench mode)
   --namespace NAMESPACE    Notebook namespace (required for single-workbench mode)
   --all                    Operate on every notebook in the cluster
+  -y, --yes                Skip confirmation prompts (for automation / CI)
 
 One of "--name NAME --namespace NAMESPACE" or "--all" must be provided.
 
@@ -54,6 +55,90 @@ Examples:
   $(basename "$0") verify  --name my-wb --namespace my-ns
 EOF
     exit 1
+}
+
+# ──────────────────────────────────────────────
+# Confirmation prompts
+# ──────────────────────────────────────────────
+
+# Print the cluster the user is currently connected to.
+print_cluster_info() {
+    local cluster server user
+    cluster=$(oc whoami --show-server 2>/dev/null || echo "<unknown>")
+    user=$(oc whoami 2>/dev/null || echo "<unknown>")
+    echo "  Cluster: $cluster"
+    echo "  User:    $user"
+}
+
+# Ask the user to type "yes" to continue. Aborts on anything else.
+# Skipped when SKIP_CONFIRM=true (--yes flag).
+ask_confirmation() {
+    if [ "${SKIP_CONFIRM:-false}" = true ]; then
+        return 0
+    fi
+    echo ""
+    read -r -p "Type 'yes' to continue: " answer
+    if [ "$answer" != "yes" ]; then
+        echo "Aborted."
+        exit 1
+    fi
+}
+
+# Confirmation gate for the patch command.
+confirm_patch() {
+    cat <<'EOF'
+
+╔════════════════════════════════════════════════════════════════╗
+║                        *** WARNING ***                         ║
+║                                                                ║
+║  You are about to PATCH notebook resources on this cluster.    ║
+║                                                                ║
+║  This operation will:                                          ║
+║   - Modify notebook CRs (annotations, containers, volumes)     ║
+║   - Delete StatefulSets, causing RUNNING workbenches to        ║
+║     RESTART                                                    ║
+║   - Strip legacy OAuth-proxy configuration                     ║
+║                                                                ║
+║  BEFORE PROCEEDING, make sure you have:                        ║
+║   1. Stopped all affected workbenches                          ║
+║   2. Verified you are connected to the correct cluster         ║
+║   3. Backed up any critical notebook CRs if needed             ║
+║                                                                ║
+║  RISK: Running this on active workbenches may cause DATA LOSS  ║
+║  or DISRUPTION to users.                                       ║
+╚════════════════════════════════════════════════════════════════╝
+EOF
+    print_cluster_info
+    if [ "$ALL" = true ]; then
+        echo "  Target:  ALL notebooks in the cluster"
+    else
+        echo "  Target:  notebook '$NAME' in namespace '$NAMESPACE'"
+    fi
+    ask_confirmation
+}
+
+# Confirmation gate for the cleanup command.
+confirm_cleanup() {
+    cat <<'EOF'
+
+╔════════════════════════════════════════════════════════════════╗
+║                        *** CAUTION ***                         ║
+║                                                                ║
+║  You are about to DELETE legacy OAuth resources on this        ║
+║  cluster (Routes, Services, Secrets, OAuthClients).            ║
+║                                                                ║
+║  Only run this AFTER the patch + verify steps have completed   ║
+║  successfully. Cleaning up before migration is finished may    ║
+║  leave workbenches in a broken state.                          ║
+╚════════════════════════════════════════════════════════════════╝
+EOF
+    print_cluster_info
+    if [ "$ALL" = true ]; then
+        echo "  Target:  ALL notebooks in the cluster"
+    else
+        echo "  Target:  notebook '$NAME' in namespace '$NAMESPACE'"
+    fi
+    ask_confirmation
 }
 
 # ──────────────────────────────────────────────
@@ -240,6 +325,7 @@ fi
 COMMAND="$1"; shift
 
 ALL=false
+SKIP_CONFIRM=false
 NAME=""
 NAMESPACE=""
 
@@ -256,6 +342,10 @@ while [ $# -gt 0 ]; do
         --namespace)
             NAMESPACE="$2"
             shift 2
+            ;;
+        -y|--yes)
+            SKIP_CONFIRM=true
+            shift
             ;;
         -h|--help)
             usage
@@ -285,6 +375,7 @@ fi
 # ──────────────────────────────────────────────
 case "$COMMAND" in
     patch)
+        confirm_patch
         if [ "$ALL" = true ]; then
             process_all patch_workbench
         else
@@ -292,6 +383,7 @@ case "$COMMAND" in
         fi
         ;;
     cleanup)
+        confirm_cleanup
         if [ "$ALL" = true ]; then
             process_all cleanup_workbench
         else

@@ -10,8 +10,12 @@ Helper script for migrating RHOAI workbenches from the OAuth-proxy auth model (R
 ## Usage
 
 ```bash
-./workbench-2.x-to-3.x-upgrade.sh <command> [--name NAME --namespace NAMESPACE | --all]
+./workbench-2.x-to-3.x-upgrade.sh <command> [--name NAME --namespace NAMESPACE | --all] [-y|--yes]
 ```
+
+The `patch` and `cleanup` commands display an interactive confirmation prompt showing
+the target cluster and a list of risks. Pass `-y` / `--yes` to skip the prompt
+(e.g. in CI/automation pipelines).
 
 ### Commands
 
