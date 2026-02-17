@@ -9,8 +9,15 @@
 #   ./workbench-2.x-to-3.x-upgrade.sh <command> [--name NAME --namespace NAMESPACE | --all]
 #
 # IMPORTANT: The patch operation causes running workbenches to restart.
-# Stop all affected workbenches before patching to avoid data loss or
-# disruption to users, and start them again afterwards.
+# It is recommended to stop all affected workbenches BEFORE running the
+# patch command to avoid data loss or disruption to users.
+#
+# As a safety net, the script will automatically stop any workbench that
+# is still running before patching it (by adding the
+# kubeflow-resource-stopped annotation and waiting for the pod and
+# StatefulSet to terminate). After patching, workbenches that were
+# stopped by the script are restarted automatically.
+# Use --skip-stop to disable this automatic stop/restart behaviour.
 #
 # Main workflow commands (run in order: patch → verify → cleanup):
 #   patch             - Patch notebook resources for 3.x auth model
@@ -39,9 +46,12 @@ Usage: $(basename "$0") <command> [options]
 Main workflow commands (run in order: patch → verify → cleanup):
   patch             Patch notebook CR for the 3.x auth model (removes oauth-proxy
                     sidecar, adds inject-auth annotation, deletes StatefulSet).
-                    WARNING: This causes running workbenches to restart. Stop them first.
+                    WARNING: Running workbenches will be restarted — stop them first.
+                    As a safety net, any still-running workbench is stopped
+                    automatically before patching and restarted afterwards.
+                    Use --skip-stop to disable this automatic stop/restart.
   verify            Check migration and/or cleanup state.
-  cleanup           Remove leftover OAuth resources (Route, Services, Secrets,
+  cleanup           Remove leftover OAuth resources (Route, Service, Secrets,
                     OAuthClient) that are no longer needed after migration.
 
 Troubleshooting commands (run only if odh-cli pre-check fails for kueue label on notebook):
@@ -56,6 +66,9 @@ Options:
   --all                    Operate on every notebook in the cluster
   --phase PHASE            Verify phase: migration|cleanup|all (verify command only;
                            default: migration)
+  --skip-stop              Skip the automatic stop/restart of workbenches before
+                           and after patching (use only if you are managing the
+                           workbench lifecycle manually)
   -y, --yes                Skip confirmation prompts (for automation / CI)
   --queue-name NAME        Queue name value for attach-kueue-label (default: 'default')
 
@@ -63,6 +76,7 @@ One of "--name NAME --namespace NAMESPACE" or "--all" must be provided.
 
 Examples (main workflow):
   $(basename "$0") patch   --name my-wb --namespace my-ns
+  $(basename "$0") patch   --all --skip-stop
   $(basename "$0") cleanup --all
   $(basename "$0") verify  --name my-wb --namespace my-ns
   $(basename "$0") verify  --all
@@ -102,14 +116,38 @@ ask_confirmation() {
     fi
 }
 
+# EXIT trap for the patch command.  If the script exits unexpectedly while
+# we have workbenches stopped, warn the user so they can restart them.
+patch_exit_handler() {
+    local exit_code=$?
+    if [ -n "${STOPPED_BY_SCRIPT:-}" ] && [ -s "$STOPPED_BY_SCRIPT" ]; then
+        echo ""
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║  WARNING: Script exited before restarting these workbenches:   ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        while read -r wb_name wb_namespace; do
+            echo "  - $wb_name  (namespace: $wb_namespace)"
+        done < "$STOPPED_BY_SCRIPT"
+        echo ""
+        echo "  To restart them manually, remove the 'kubeflow-resource-stopped'"
+        echo "  annotation from each notebook, e.g.:"
+        echo "    oc annotate notebook <name> -n <namespace> kubeflow-resource-stopped-"
+        echo ""
+        rm -f "$STOPPED_BY_SCRIPT"
+    fi
+    return "$exit_code"
+}
+
 # Confirmation gate for the patch command.
 confirm_patch() {
-    cat <<'EOF'
+    if [ "$SKIP_STOP" = true ]; then
+        cat <<'EOF'
 
 ╔════════════════════════════════════════════════════════════════╗
 ║                        *** WARNING ***                         ║
 ║                                                                ║
-║  You are about to PATCH notebook resources on this cluster.    ║
+║  You are about to PATCH notebook resources on this cluster     ║
+║  with --skip-stop enabled (automatic stop/restart disabled).   ║
 ║                                                                ║
 ║  This operation will:                                          ║
 ║   - Modify notebook CRs (annotations, containers, volumes)     ║
@@ -126,6 +164,33 @@ confirm_patch() {
 ║  or DISRUPTION to users.                                       ║
 ╚════════════════════════════════════════════════════════════════╝
 EOF
+    else
+        cat <<'EOF'
+
+╔════════════════════════════════════════════════════════════════╗
+║                        *** WARNING ***                         ║
+║                                                                ║
+║  You are about to PATCH notebook resources on this cluster.    ║
+║                                                                ║
+║  This operation will:                                          ║
+║   - Modify notebook CRs (annotations, containers, volumes)     ║
+║   - Delete StatefulSets                                        ║
+║   - Strip legacy OAuth-proxy configuration                     ║
+║                                                                ║
+║  BEFORE PROCEEDING, make sure you have:                        ║
+║   1. Stopped all affected workbenches                          ║
+║   2. Verified you are connected to the correct cluster         ║
+║   3. Backed up any critical notebook CRs if needed             ║
+║                                                                ║
+║  RISK: Running this on active workbenches may cause DATA LOSS  ║
+║  or DISRUPTION to users.                                       ║
+║                                                                ║
+║  SAFETY NET: Any still-running workbenches will be stopped     ║
+║  automatically before patching and restarted afterwards.       ║
+║  Use --skip-stop to disable this behaviour.                    ║
+╚════════════════════════════════════════════════════════════════╝
+EOF
+    fi
     print_cluster_info
     if [ "$ALL" = true ]; then
         echo "  Target:  ALL notebooks in the cluster"
@@ -190,6 +255,119 @@ ask_cleanup_continue_or_skip() {
 # ──────────────────────────────────────────────
 # Core functions (single workbench)
 # ──────────────────────────────────────────────
+
+# Stop a running workbench by annotating the Notebook CR with
+# kubeflow-resource-stopped and waiting for the owning StatefulSet and
+# its pod(s) to terminate.
+# Workbenches that are already stopped (annotation present) are skipped.
+# Workbenches that we actually stop are recorded in $STOPPED_BY_SCRIPT
+# so they can be restarted after patching.
+#   $1 = notebook name
+#   $2 = namespace
+stop_workbench() {
+    local name="$1"
+    local namespace="$2"
+
+    # Check if the workbench is already stopped (annotation present)
+    local stopped_annotation
+    stopped_annotation=$(oc get notebook "$name" -n "$namespace" \
+        -o jsonpath='{.metadata.annotations.kubeflow-resource-stopped}' 2>/dev/null)
+
+    if [ -n "$stopped_annotation" ]; then
+        echo "  Workbench '$name' in '$namespace' is already stopped (since $stopped_annotation) — skipping."
+        return 0
+    fi
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    echo "Stopping workbench '$name' in namespace '$namespace'..."
+
+    # Annotate the Notebook CR to request a stop
+    oc annotate notebook "$name" -n "$namespace" \
+        "kubeflow-resource-stopped=$timestamp" --overwrite
+    echo "  Annotation 'kubeflow-resource-stopped=$timestamp' applied."
+
+    # Record this workbench so we can restart it after patching
+    echo "$name $namespace" >> "$STOPPED_BY_SCRIPT"
+
+    # Find the StatefulSet owned by this Notebook (via ownerReferences)
+    local sts_name
+    sts_name=$(oc get statefulsets -n "$namespace" -o json | jq -r \
+        --arg nb "$name" \
+        '.items[] |
+         select(.metadata.ownerReferences[]? |
+                select(.kind == "Notebook" and .name == $nb)) |
+         .metadata.name')
+
+    if [ -z "$sts_name" ]; then
+        echo "  No StatefulSet found for notebook '$name' — workbench may already be stopped."
+        return 0
+    fi
+
+    echo "  Found StatefulSet: $sts_name"
+
+    # Find pods owned by the StatefulSet (via ownerReferences)
+    local pod_names
+    pod_names=$(oc get pods -n "$namespace" -o json | jq -r \
+        --arg sts "$sts_name" \
+        '.items[] |
+         select(.metadata.ownerReferences[]? |
+                select(.kind == "StatefulSet" and .name == $sts)) |
+         .metadata.name')
+
+    # Wait for pods to terminate
+    if [ -n "$pod_names" ]; then
+        echo "  Waiting for pod(s) to terminate..."
+        for pod in $pod_names; do
+            echo "    Waiting for pod '$pod'..."
+            oc wait --for=delete pod/"$pod" -n "$namespace" --timeout=120s 2>/dev/null || true
+        done
+    else
+        echo "  No running pods found for StatefulSet '$sts_name'."
+    fi
+
+    # Wait for the StatefulSet to scale to 0 or be deleted
+    echo "  Waiting for StatefulSet '$sts_name' to scale down..."
+    local retries=0
+    local max_retries=60
+    while [ "$retries" -lt "$max_retries" ]; do
+        local current_replicas
+        current_replicas=$(oc get statefulset "$sts_name" -n "$namespace" \
+            -o jsonpath='{.spec.replicas}' 2>/dev/null) || {
+            echo "  StatefulSet '$sts_name' has been removed."
+            break
+        }
+        if [ "$current_replicas" = "0" ]; then
+            echo "  StatefulSet '$sts_name' scaled to 0 replicas."
+            break
+        fi
+        retries=$((retries + 1))
+        sleep 2
+    done
+
+    if [ "$retries" -ge "$max_retries" ]; then
+        echo "  WARNING: Timed out waiting for StatefulSet '$sts_name' to scale down."
+        echo "  The workbench may not have stopped cleanly. Proceed with caution."
+        return 1
+    fi
+
+    echo "  Workbench '$name' stopped successfully."
+}
+
+# Restart a workbench that was stopped by the script by removing the
+# kubeflow-resource-stopped annotation.
+#   $1 = notebook name
+#   $2 = namespace
+restart_workbench() {
+    local name="$1"
+    local namespace="$2"
+
+    echo "  Restarting workbench '$name' in namespace '$namespace'..."
+    oc annotate notebook "$name" -n "$namespace" \
+        "kubeflow-resource-stopped-"
+    echo "  Annotation 'kubeflow-resource-stopped' removed — workbench will start."
+}
 
 # Patch a single notebook for the 3.x auth model.
 #   $1 = notebook name
@@ -625,6 +803,7 @@ COMMAND="$1"; shift
 ALL=false
 SKIP_CONFIRM=false
 VERIFY_PHASE="migration"
+SKIP_STOP=false
 NAME=""
 NAMESPACE=""
 QUEUE_NAME="default"
@@ -646,6 +825,10 @@ while [ $# -gt 0 ]; do
         --phase)
             VERIFY_PHASE="$2"
             shift 2
+            ;;
+        --skip-stop)
+            SKIP_STOP=true
+            shift
             ;;
         -y|--yes)
             SKIP_CONFIRM=true
@@ -699,11 +882,41 @@ fi
 case "$COMMAND" in
     patch)
         confirm_patch
+
+        # Temp file that tracks workbenches we stopped (so we can restart them).
+        # Written to by stop_workbench(), read after patching.
+        STOPPED_BY_SCRIPT=$(mktemp)
+        trap 'patch_exit_handler' EXIT
+
+        if [ "$SKIP_STOP" = false ]; then
+            echo ""
+            echo "=== Stopping any still-running workbench(es) before patching ==="
+            if [ "$ALL" = true ]; then
+                process_all stop_workbench
+            else
+                stop_workbench "$NAME" "$NAMESPACE"
+            fi
+            echo ""
+        fi
+
         if [ "$ALL" = true ]; then
             process_all patch_workbench
         else
             patch_workbench "$NAME" "$NAMESPACE"
         fi
+
+        # Restart workbenches that were stopped by the script
+        if [ -s "$STOPPED_BY_SCRIPT" ]; then
+            echo ""
+            echo "=== Restarting workbenches that were stopped for migration ==="
+            while read -r wb_name wb_namespace; do
+                restart_workbench "$wb_name" "$wb_namespace"
+            done < "$STOPPED_BY_SCRIPT"
+            echo ""
+        fi
+
+        rm -f "$STOPPED_BY_SCRIPT"
+        trap - EXIT
         ;;
     cleanup)
         confirm_cleanup
