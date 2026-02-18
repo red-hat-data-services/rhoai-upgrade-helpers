@@ -13,6 +13,7 @@
 # disruption to users, and start them again afterwards.
 #
 # Main workflow commands (run in order: patch → verify → cleanup):
+#   list              - Identify legacy / migrated / invalid workbenches
 #   patch             - Patch notebook resources for 3.x auth model
 #   verify            - Verify migration and/or cleanup status
 #   cleanup           - Remove stale OAuth routes, secrets, and OAuthClients
@@ -21,6 +22,8 @@
 #   attach-kueue-label - Add kueue queue-name label to notebooks in kueue-managed namespaces
 #
 # Examples:
+#   ./workbench-2.x-to-3.x-upgrade.sh list    --all
+#   ./workbench-2.x-to-3.x-upgrade.sh list    --name my-wb --namespace my-ns
 #   ./workbench-2.x-to-3.x-upgrade.sh patch   --name my-wb --namespace my-ns
 #   ./workbench-2.x-to-3.x-upgrade.sh patch   --all
 #   ./workbench-2.x-to-3.x-upgrade.sh cleanup --all
@@ -37,11 +40,14 @@ usage() {
 Usage: $(basename "$0") <command> [options]
 
 Main workflow commands (run in order: patch → verify → cleanup):
+  list              Identify legacy, migrated, and invalid workbenches by inspecting
+                    Notebook CR annotations. Use this before migrating to see which
+                    workbenches still need to be patched.
   patch             Patch notebook CR for the 3.x auth model (removes oauth-proxy
                     sidecar, adds inject-auth annotation, deletes StatefulSet).
                     WARNING: This causes running workbenches to restart. Stop them first.
   verify            Check migration and/or cleanup state.
-  cleanup           Remove leftover OAuth resources (Route, Services, Secrets,
+  cleanup           Remove leftover OAuth resources (Route, Service, Secrets,
                     OAuthClient) that are no longer needed after migration.
 
 Troubleshooting commands (run only if odh-cli pre-check fails for kueue label on notebook):
@@ -62,6 +68,7 @@ Options:
 One of "--name NAME --namespace NAMESPACE" or "--all" must be provided.
 
 Examples (main workflow):
+  $(basename "$0") list    --all
   $(basename "$0") patch   --name my-wb --namespace my-ns
   $(basename "$0") cleanup --all
   $(basename "$0") verify  --name my-wb --namespace my-ns
@@ -584,6 +591,104 @@ patch_kueue_label_workbench() {
 }
 
 # ──────────────────────────────────────────────
+# List / check migration status
+# ──────────────────────────────────────────────
+
+# Check migration status of a single notebook.
+#   $1 = notebook name
+#   $2 = namespace
+list_workbench() {
+    local name="$1"
+    local namespace="$2"
+    local inject_oauth inject_auth status
+
+    inject_oauth=$(oc get notebook "$name" -n "$namespace" \
+        -o jsonpath='{.metadata.annotations.notebooks\.opendatahub\.io/inject-oauth}' 2>/dev/null)
+    inject_auth=$(oc get notebook "$name" -n "$namespace" \
+        -o jsonpath='{.metadata.annotations.notebooks\.opendatahub\.io/inject-auth}' 2>/dev/null)
+
+    echo "=== Notebook: $name  (namespace: $namespace) ==="
+    echo "  inject-oauth annotation: ${inject_oauth:-<not set>}"
+    echo "  inject-auth  annotation: ${inject_auth:-<not set>}"
+
+    if [ "$inject_oauth" = "true" ] && [ "$inject_auth" = "true" ]; then
+        echo "  Status: INVALID — both inject-oauth and inject-auth are set (likely an incomplete migration)."
+    elif [ "$inject_auth" = "true" ]; then
+        echo "  Status: MIGRATED"
+    elif [ "$inject_oauth" = "true" ]; then
+        echo "  Status: LEGACY — needs migration to 3.x"
+    else
+        echo "  Status: UNKNOWN — neither annotation found"
+    fi
+    echo ""
+}
+
+# Scan all notebooks on the cluster, classify each by migration status,
+# and print a summary table. Uses a single API call for efficiency.
+list_all_workbenches() {
+    local json total legacy=0 migrated=0 invalid=0 unknown=0
+
+    json=$(oc get notebooks --all-namespaces -o json 2>/dev/null)
+    total=$(echo "$json" | jq '.items | length')
+
+    if [ "$total" -eq 0 ]; then
+        echo "No notebooks found on the cluster."
+        return 0
+    fi
+
+    echo ""
+    echo "Scanning all notebooks on the cluster..."
+    echo ""
+    printf "  %-40s %-30s %s\n" "NAME" "NAMESPACE" "STATUS"
+    printf "  %-40s %-30s %s\n" "----" "---------" "------"
+
+    while IFS='|' read -r nb_name nb_namespace oauth auth; do
+        local status
+        if [ "$oauth" = "true" ] && [ "$auth" = "true" ]; then
+            status="INVALID"
+            invalid=$((invalid + 1))
+        elif [ "$auth" = "true" ]; then
+            status="MIGRATED (3.x)"
+            migrated=$((migrated + 1))
+        elif [ "$oauth" = "true" ]; then
+            status="LEGACY (2.x)"
+            legacy=$((legacy + 1))
+        else
+            status="UNKNOWN"
+            unknown=$((unknown + 1))
+        fi
+        printf "  %-40s %-30s %s\n" "$nb_name" "$nb_namespace" "$status"
+    done < <(echo "$json" | jq -r '.items[] | [
+        .metadata.name,
+        .metadata.namespace,
+        (.metadata.annotations["notebooks.opendatahub.io/inject-oauth"] // ""),
+        (.metadata.annotations["notebooks.opendatahub.io/inject-auth"] // "")
+    ] | join("|")')
+
+    echo ""
+    echo "Summary:"
+    echo "  Total notebooks:  $total"
+    echo "  Legacy (2.x):     $legacy"
+    echo "  Migrated (3.x):   $migrated"
+    echo "  Invalid state:    $invalid"
+    echo "  Unknown:          $unknown"
+    echo ""
+
+    if [ "$legacy" -gt 0 ]; then
+        echo "  WARNING: $legacy notebook(s) still need migration (LEGACY)."
+    fi
+    if [ "$invalid" -gt 0 ]; then
+        echo "  ERROR:   $invalid notebook(s) are in an invalid state — review manually."
+        echo "           Run '$(basename "$0") verify --name <name> --namespace <namespace> --phase migration' to review the migration status."
+        echo "           Run '$(basename "$0") patch --name <name> --namespace <namespace>' to patch the notebook to the 3.x auth model."
+    fi
+    if [ "$legacy" -eq 0 ] && [ "$invalid" -eq 0 ]; then
+        echo "  OK: All notebooks have been migrated."
+    fi
+    echo ""
+}
+
+# ──────────────────────────────────────────────
 # Batch helper — run a function for every notebook
 # ──────────────────────────────────────────────
 process_all() {
@@ -697,6 +802,13 @@ fi
 # Dispatch
 # ──────────────────────────────────────────────
 case "$COMMAND" in
+    list)
+        if [ "$ALL" = true ]; then
+            list_all_workbenches
+        else
+            list_workbench "$NAME" "$NAMESPACE"
+        fi
+        ;;
     patch)
         confirm_patch
         if [ "$ALL" = true ]; then
