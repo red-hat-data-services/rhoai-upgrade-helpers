@@ -12,7 +12,7 @@ set -euo pipefail
 # Configuration
 NAMESPACE="${TRUSTYAI_NAMESPACE:-}"
 BACKUP_FILE=""
-ROUTE_LABEL="${ROUTE_LABEL:-app=trustyai-service}"
+ROUTE_LABEL="${ROUTE_LABEL:-trustyai-service-name=trustyai-service}"
 DRY_RUN=false
 SKIP_EXISTING=false
 
@@ -48,7 +48,7 @@ Restore TrustyAI scheduled metrics from a backup file.
 OPTIONS:
     -n, --namespace NAMESPACE    OpenShift namespace (required)
     -f, --file FILE              Backup file to restore from (required)
-    -l, --route-label LABEL      Route label selector (default: app=trustyai-service)
+    -l, --route-label LABEL      Route label selector (default: trustyai-service-name=trustyai-service)
     -d, --dry-run                Show what would be restored without making changes
     -s, --skip-existing          Skip metrics that already exist (check by model ID and metric type)
     -h, --help                   Show this help message
