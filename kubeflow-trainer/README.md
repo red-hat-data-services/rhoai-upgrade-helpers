@@ -36,8 +36,21 @@ You can list PyTorchJob resources in your cluster using `oc get pytorchjobs -A`.
 
 # Examples
 
-```bash
+```shell
 # Verify migration
 chmod +x kubeflow-trainer-verification.sh
 ./kubeflow-trainer-verification.sh
+```
+
+# Troubleshooting
+In case the Training Operator component doesn't start then the issue is shown in DSC CR state. You can check the DSC state by running the following command:
+
+```shell
+oc describe dsc
+```
+
+In case the Training Operator starts but PyTorchJobs are not reconciled then you can inspect KFTO operator log by running the following command:
+
+```shell
+oc logs -l app.kubernetes.io/name=trainer -n redhat-ods-applications --tail=-1
 ```
