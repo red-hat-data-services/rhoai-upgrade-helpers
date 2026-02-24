@@ -15,7 +15,7 @@
 # Commands:
 #   patch    - Patch notebook resources for 3.x auth model
 #   cleanup  - Remove stale OAuth routes, secrets, and OAuthClients
-#   verify   - Verify the migration succeeded
+#   verify   - Verify migration and/or cleanup status
 #
 # Examples:
 #   ./workbench-2.x-to-3.x-upgrade.sh patch   --name my-wb --namespace my-ns
@@ -37,14 +37,16 @@ Commands:
   patch    Patch notebook CR for the 3.x auth model (removes oauth-proxy
            sidecar, adds inject-auth annotation, deletes StatefulSet).
            WARNING: This causes running workbenches to restart. Stop them first.
-  cleanup  Remove leftover OAuth resources (Route, Services, Secrets,
+  cleanup  Remove leftover OAuth resources (Route, Service, Secrets,
            OAuthClient) that are no longer needed after migration.
-  verify   Check that the migration was applied correctly.
+  verify   Check migration and/or cleanup state.
 
 Options:
   --name NAME              Notebook name   (required for single-workbench mode)
   --namespace NAMESPACE    Notebook namespace (required for single-workbench mode)
   --all                    Operate on every notebook in the cluster
+  --phase PHASE            Verify phase: migration|cleanup|all (verify command only;
+                           default: migration)
   -y, --yes                Skip confirmation prompts (for automation / CI)
 
 One of "--name NAME --namespace NAMESPACE" or "--all" must be provided.
@@ -53,6 +55,8 @@ Examples:
   $(basename "$0") patch   --name my-wb --namespace my-ns
   $(basename "$0") cleanup --all
   $(basename "$0") verify  --name my-wb --namespace my-ns
+  $(basename "$0") verify  --all
+  $(basename "$0") verify  --all --phase cleanup
 EOF
     exit 1
 }
@@ -125,7 +129,7 @@ confirm_cleanup() {
 ║                        *** CAUTION ***                         ║
 ║                                                                ║
 ║  You are about to DELETE legacy OAuth resources on this        ║
-║  cluster (Routes, Services, Secrets, OAuthClients).            ║
+║  cluster (Routes, Service, Secrets, OAuthClients).             ║
 ║                                                                ║
 ║  Only run this AFTER the patch + verify steps have completed   ║
 ║  successfully. Cleaning up before migration is finished may    ║
@@ -277,14 +281,16 @@ cleanup_workbench() {
         fi
     fi
 
-    echo "[1/3] Removing Route and Services..."
+    echo "[1/4] Removing Route..."
     oc delete route "$name" -n "$namespace" --ignore-not-found
+
+    echo "[2/4] Removing Service..."
     oc delete service "$name" "${name}-tls" -n "$namespace" --ignore-not-found
 
-    echo "[2/3] Removing Secrets..."
+    echo "[3/4] Removing Secrets..."
     oc delete secret "${name}-oauth-client" "${name}-oauth-config" "${name}-tls" -n "$namespace" --ignore-not-found
 
-    echo "[3/3] Removing OAuthClient: ${name}-${namespace}-oauth-client"
+    echo "[4/4] Removing OAuthClient: ${name}-${namespace}-oauth-client"
     oc delete oauthclient "${name}-${namespace}-oauth-client" --ignore-not-found
 
     echo "=========================================================="
@@ -384,19 +390,132 @@ check_workbench_migration() {
     fi
 }
 
-# Verify migration status for a single notebook.
+# Run cleanup checks to confirm legacy resources are removed.
+#   $1 = notebook name
+#   $2 = namespace
+check_workbench_cleanup() {
+    local name="$1"
+    local namespace="$2"
+    local verbose="${3:-false}"
+    local pass=true
+
+    if oc get route "$name" -n "$namespace" >/dev/null 2>&1; then
+        if [ "$verbose" = true ]; then
+            echo "  FAIL: Route '$name' still exists"
+        fi
+        pass=false
+    else
+        if [ "$verbose" = true ]; then
+            echo "  PASS: Route '$name' is removed"
+        fi
+    fi
+
+    if oc get service "${name}-tls" -n "$namespace" >/dev/null 2>&1; then
+        if [ "$verbose" = true ]; then
+            echo "  FAIL: Service '${name}-tls' still exists"
+        fi
+        pass=false
+    else
+        if [ "$verbose" = true ]; then
+            echo "  PASS: Service '${name}-tls' is removed"
+        fi
+    fi
+
+    if oc get secret "${name}-oauth-client" -n "$namespace" >/dev/null 2>&1; then
+        if [ "$verbose" = true ]; then
+            echo "  FAIL: Secret '${name}-oauth-client' still exists"
+        fi
+        pass=false
+    else
+        if [ "$verbose" = true ]; then
+            echo "  PASS: Secret '${name}-oauth-client' is removed"
+        fi
+    fi
+
+    if oc get secret "${name}-oauth-config" -n "$namespace" >/dev/null 2>&1; then
+        if [ "$verbose" = true ]; then
+            echo "  FAIL: Secret '${name}-oauth-config' still exists"
+        fi
+        pass=false
+    else
+        if [ "$verbose" = true ]; then
+            echo "  PASS: Secret '${name}-oauth-config' is removed"
+        fi
+    fi
+
+    if oc get secret "${name}-tls" -n "$namespace" >/dev/null 2>&1; then
+        if [ "$verbose" = true ]; then
+            echo "  FAIL: Secret '${name}-tls' still exists"
+        fi
+        pass=false
+    else
+        if [ "$verbose" = true ]; then
+            echo "  PASS: Secret '${name}-tls' is removed"
+        fi
+    fi
+
+    if oc get oauthclient "${name}-${namespace}-oauth-client" >/dev/null 2>&1; then
+        if [ "$verbose" = true ]; then
+            echo "  FAIL: OAuthClient '${name}-${namespace}-oauth-client' still exists"
+        fi
+        pass=false
+    else
+        if [ "$verbose" = true ]; then
+            echo "  PASS: OAuthClient '${name}-${namespace}-oauth-client' is removed"
+        fi
+    fi
+
+    if [ "$pass" = true ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Verify migration and/or cleanup status for a single notebook.
 #   $1 = notebook name
 #   $2 = namespace
 verify_workbench() {
     local name="$1"
     local namespace="$2"
+    local pass=true
 
     echo "=== Verifying Notebook: $name in $namespace ==="
 
-    if check_workbench_migration "$name" "$namespace" true; then
-        echo "=== RESULT: ALL CHECKS PASSED ==="
-    else
-        echo "=== RESULT: SOME CHECKS FAILED ==="
+    case "${VERIFY_PHASE:-migration}" in
+        migration)
+            echo "  Phase: migration"
+            check_workbench_migration "$name" "$namespace" true || pass=false
+            [ "$pass" = true ] && echo "=== RESULT: ALL CHECKS PASSED ===" || echo "=== RESULT: SOME CHECKS FAILED ==="
+            ;;
+        cleanup)
+            echo "  Phase: cleanup"
+            check_workbench_cleanup "$name" "$namespace" true || pass=false
+            [ "$pass" = true ] && echo "=== RESULT: ALL CHECKS PASSED ===" || echo "=== RESULT: SOME CHECKS FAILED ==="
+            ;;
+        all)
+            echo "  Phase: migration"
+            if ! check_workbench_migration "$name" "$namespace" true; then
+                pass=false
+            fi
+            echo "  Phase: cleanup"
+            if ! check_workbench_cleanup "$name" "$namespace" true; then
+                pass=false
+            fi
+            if [ "$pass" = true ]; then
+                echo "=== RESULT: ALL CHECKS PASSED ==="
+            else
+                echo "=== RESULT: SOME CHECKS FAILED ==="
+            fi
+            ;;
+        *)
+            echo "Error: Unsupported verify phase '${VERIFY_PHASE}'."
+            exit 1
+            ;;
+    esac
+
+    if [ "$pass" = false ]; then
+        return 1
     fi
     echo ""
 }
@@ -406,12 +525,29 @@ verify_workbench() {
 # ──────────────────────────────────────────────
 process_all() {
     local func="$1"
+    local total=0
+    local failed=0
 
-    oc get notebooks --all-namespaces \
-        -o custom-columns=NAME:.metadata.name,NS:.metadata.namespace \
-        --no-headers | while read -r nb_name nb_namespace; do
-        "$func" "$nb_name" "$nb_namespace"
-    done
+    while read -r nb_name nb_namespace; do
+        total=$((total + 1))
+        if ! "$func" "$nb_name" "$nb_namespace"; then
+            failed=$((failed + 1))
+        fi
+    done < <(
+        oc get notebooks --all-namespaces \
+            -o custom-columns=NAME:.metadata.name,NS:.metadata.namespace \
+            --no-headers
+    )
+
+    if [ "$failed" -gt 0 ]; then
+        echo ""
+        echo "Processed $total notebook(s): $failed failed."
+        return 1
+    fi
+
+    echo ""
+    echo "Processed $total notebook(s): all succeeded."
+    return 0
 }
 
 # ──────────────────────────────────────────────
@@ -425,6 +561,7 @@ COMMAND="$1"; shift
 
 ALL=false
 SKIP_CONFIRM=false
+VERIFY_PHASE="migration"
 NAME=""
 NAMESPACE=""
 
@@ -440,6 +577,10 @@ while [ $# -gt 0 ]; do
             ;;
         --namespace)
             NAMESPACE="$2"
+            shift 2
+            ;;
+        --phase)
+            VERIFY_PHASE="$2"
             shift 2
             ;;
         -y|--yes)
@@ -467,6 +608,21 @@ if [ "$ALL" = false ]; then
         echo "Error: Both --name and --namespace are required for single-workbench mode."
         usage
     fi
+fi
+
+if [ "$COMMAND" != "verify" ] && [ "$VERIFY_PHASE" != "migration" ]; then
+    echo "Error: --phase is only supported with the verify command."
+    usage
+fi
+
+if [ "$COMMAND" = "verify" ]; then
+    case "$VERIFY_PHASE" in
+        migration|cleanup|all) ;;
+        *)
+            echo "Error: Invalid --phase '$VERIFY_PHASE'. Use migration, cleanup, or all."
+            usage
+            ;;
+    esac
 fi
 
 # ──────────────────────────────────────────────
