@@ -14,17 +14,19 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 usage() {
-    echo -e "Usage: $0 ${BOLD}-n|--namespace <namespace>${NC} [${BOLD}--check${NC}|${BOLD}--fix${NC}] [${BOLD}--dry-run${NC}]"
+    echo -e "Usage: $0 ${BOLD}-n|--namespace <namespace>${NC} ${BOLD}-g|--gorch-name <name>${NC} [${BOLD}--check${NC}|${BOLD}--fix${NC}] [${BOLD}--dry-run${NC}]"
     echo ""
     echo "  -n, --namespace <ns>   Target namespace (required)"
-    echo "  --check                Only check: list CRs and deployment status, no patching"
-    echo "  --fix                  Apply readinessProbe patch to deployments (default)"
-    echo "  --dry-run              With --fix: show what would be patched, do not apply"
+    echo "  -g, --gorch-name <name> GuardrailsOrchestrator CR/deployment name (required)"
+    echo "  --check                Show current status only: OK / NEEDS PATCH / MISSING (default)"
+    echo "  --fix                  Apply readinessProbe patch to deployment"
+    echo "  --dry-run              Show what would be patched without applying (runs fix path in preview)"
     exit 1
 }
 
 NAMESPACE=""
-MODE="fix"
+GORCH_NAME=""
+MODE="check"
 DRY_RUN=false
 
 while [ $# -gt 0 ]; do
@@ -37,6 +39,23 @@ while [ $# -gt 0 ]; do
                 echo -e "${RED}ERROR: --namespace requires a value${NC}"
                 usage
             fi
+            ;;
+        --namespace=*)
+            NAMESPACE="${1#*=}"
+            shift
+            ;;
+        -g|--gorch-name)
+            if [ -n "${2:-}" ]; then
+                GORCH_NAME="$2"
+                shift 2
+            else
+                echo -e "${RED}ERROR: --gorch-name requires a value${NC}"
+                usage
+            fi
+            ;;
+        --gorch-name=*)
+            GORCH_NAME="${1#*=}"
+            shift
             ;;
         --check)
             MODE="check"
@@ -54,14 +73,8 @@ while [ $# -gt 0 ]; do
             usage
             ;;
         *)
-            # Backward compat: single positional arg = namespace
-            if [ -z "${NAMESPACE}" ]; then
-                NAMESPACE="$1"
-                shift
-            else
-                echo -e "${RED}ERROR: Unknown argument: $1${NC}"
-                usage
-            fi
+            echo -e "${RED}ERROR: Unknown argument: $1${NC}"
+            usage
             ;;
     esac
 done
@@ -70,9 +83,12 @@ if [ -z "${NAMESPACE}" ]; then
     echo -e "${RED}ERROR: Namespace is required${NC}"
     usage
 fi
+if [ -z "${GORCH_NAME}" ]; then
+    echo -e "${RED}ERROR: --gorch-name is required${NC}"
+    usage
+fi
 
 FAILED_DEPLOYMENTS=()
-PATCHED_COUNT=0
 
 echo ""
 # Check if the user is logged in
@@ -87,30 +103,24 @@ if ! oc get namespace "${NAMESPACE}" &>/dev/null; then
     exit 1
 fi
 
-# Check if GuardrailsOrchestrator CRs exist in namespace
-echo -e "Checking for GuardrailsOrchestrator CRs in namespace ${CYAN}${NAMESPACE}${NC}"
-GORCH_CR_NAMES=$(oc get guardrailsorchestrator -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
-if [ -z "${GORCH_CR_NAMES}" ]; then
-    echo -e "${RED}No GuardrailsOrchestrator CRs found in namespace ${CYAN}${NAMESPACE}${NC}"
+# Verify the specified GuardrailsOrchestrator CR exists in namespace
+echo -e " [INFO] Checking GuardrailsOrchestrator ${CYAN}${GORCH_NAME}${NC} in namespace ${CYAN}${NAMESPACE}${NC}"
+if ! oc get guardrailsorchestrator -n "${NAMESPACE}" "${GORCH_NAME}" &>/dev/null; then
+    echo -e "${RED}ERROR: GuardrailsOrchestrator ${CYAN}${GORCH_NAME}${RED} not found in namespace ${CYAN}${NAMESPACE}${NC}"
     exit 1
 fi
 
-# Convert space-separated names to array
-read -ra GORCH_CR_ARRAY <<< "${GORCH_CR_NAMES}"
-echo ""
-echo -e "Found ${GREEN}${#GORCH_CR_ARRAY[@]}${NC} GuardrailsOrchestrator CR(s) in namespace ${CYAN}${NAMESPACE}${NC}: ${BLUE}${GORCH_CR_NAMES}${NC}"
-
-# Check if deployment has the expected readinessProbe (port 8034, path /health)
+# Check if deployment has the expected readinessProbe (port 8034, path /health) on the container matching GORCH_NAME
 needs_patch() {
     local deployment_name="$1"
     local probe_path
-    probe_path=$(oc get deployment -n "${NAMESPACE}" "${deployment_name}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="guardrails-orchestrator")].readinessProbe.httpGet.path}' 2>/dev/null || true)
+    probe_path=$(oc get deployment -n "${NAMESPACE}" "${deployment_name}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${deployment_name}"'")].readinessProbe.httpGet.path}' 2>/dev/null || true)
     local probe_port
-    probe_port=$(oc get deployment -n "${NAMESPACE}" "${deployment_name}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="guardrails-orchestrator")].readinessProbe.httpGet.port}' 2>/dev/null || true)
+    probe_port=$(oc get deployment -n "${NAMESPACE}" "${deployment_name}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${deployment_name}"'")].readinessProbe.httpGet.port}' 2>/dev/null || true)
     [ "${probe_path}" != "/health" ] || [ "${probe_port}" != "8034" ]
 }
 
-# Function to check a single deployment (--check mode)
+
 check_deployment() {
     local deployment_name="$1"
     echo ""
@@ -119,10 +129,10 @@ check_deployment() {
         return 1
     fi
     if needs_patch "${deployment_name}"; then
-        echo -e "  ${YELLOW}NEEDS PATCH${NC}  deployment ${CYAN}${deployment_name}${NC}"
+        echo -e "  ${YELLOW}[CHECK] ${RED}NEEDS PATCH${NC}  deployment ${CYAN}${deployment_name}${NC}"
         return 0
     else
-        echo -e "  ${GREEN}OK${NC}  deployment ${CYAN}${deployment_name}${NC} (readinessProbe already set)"
+        echo -e " ${YELLOW}[CHECK] ${GREEN}OK${NC}  deployment ${CYAN}${deployment_name}${NC} (readinessProbe already set)"
         return 0
     fi
 }
@@ -141,21 +151,27 @@ patch_deployment() {
     if [ "${DRY_RUN}" = true ]; then
         if needs_patch "${deployment_name}"; then
             echo -e "${CYAN}[DRY-RUN]${NC} Would patch deployment ${CYAN}${deployment_name}${NC} in namespace ${CYAN}${NAMESPACE}${NC} (add readinessProbe: port 8034, path /health)"
-            ((PATCHED_COUNT++))
         else
             echo -e "${CYAN}[DRY-RUN]${NC} Deployment ${CYAN}${deployment_name}${NC} already has expected readinessProbe, skip"
         fi
         return 0
     fi
 
-    # Patch the deployment to add the readinessProbe (port 8034, path /health, scheme HTTP)
-    echo -e "Patching deployment ${CYAN}${deployment_name}${NC} in namespace ${CYAN}${NAMESPACE}${NC}"
-    if ! oc patch deployment "${deployment_name}" -n "${NAMESPACE}" --type='strategic' -p='
+    # Skip patch and rollout if readinessProbe is already set
+    if ! needs_patch "${deployment_name}"; then
+        echo ""
+        echo -e "[INFO] Deployment ${CYAN}${deployment_name}${NC} already has expected readinessProbe, skip"
+        return 2
+    fi
+
+    # Patch the container matching deployment name (GORCH_NAME) to add readinessProbe (port 8034, path /health)
+    echo -e " [INFO] Patching deployment ${CYAN}${deployment_name}${NC} in namespace ${CYAN}${NAMESPACE}${NC}"
+    if ! oc patch deployment "${deployment_name}" -n "${NAMESPACE}" --type='strategic' -p "
 spec:
   template:
     spec:
       containers:
-      - name: guardrails-orchestrator
+      - name: ${deployment_name}
         readinessProbe:
           httpGet:
             path: /health
@@ -166,14 +182,15 @@ spec:
           periodSeconds: 20
           successThreshold: 1
           failureThreshold: 3
-'; then
+"; then
         echo -e "${RED}ERROR: Failed to patch deployment ${CYAN}${deployment_name}${NC}"
         return 1
     fi
 
     # Wait for rollout to complete
     echo ""
-    echo -e "Waiting for rollout to complete..."
+    echo -e " [INFO] Waiting for rollout to complete..."
+    echo -e ""
     if ! oc rollout status deployment "${deployment_name}" -n "${NAMESPACE}" --timeout=120s; then
         echo -e "${RED}ERROR: Deployment rollout failed for ${CYAN}${deployment_name}${NC}"
         return 1
@@ -184,45 +201,35 @@ spec:
     return 0
 }
 
-if [ "${MODE}" = "check" ]; then
+# --check: show current status only (OK / NEEDS PATCH / MISSING). --dry-run: show what would be patched, no changes.
+if [ "${MODE}" = "check" ] && [ "${DRY_RUN}" != true ]; then
     echo ""
-    echo -e "${BOLD}Check mode: deployment status in namespace ${CYAN}${NAMESPACE}${NC}"
-    for CR_NAME in "${GORCH_CR_ARRAY[@]}"; do
-        check_deployment "${CR_NAME}" || true
-    done
+    check_deployment "${GORCH_NAME}" || true
     echo ""
     echo -e "${GREEN}Check complete.${NC}"
     exit 0
 fi
 
-# Fix mode: loop through all GuardrailsOrchestrator CRs
-if [ "${DRY_RUN}" = true ]; then
-    echo -e "${BOLD}[DRY-RUN]${NC} Would patch the following deployments in namespace ${CYAN}${NAMESPACE}${NC}:"
+patch_deployment "${GORCH_NAME}"
+patch_ret=$?
+if [ "$patch_ret" -eq 0 ]; then
+    : # success
+elif [ "$patch_ret" -eq 2 ]; then
+    : # skipped (readinessProbe already present)
+else
+    FAILED_DEPLOYMENTS+=("${GORCH_NAME}")
 fi
-for CR_NAME in "${GORCH_CR_ARRAY[@]}"; do
-    if patch_deployment "${CR_NAME}"; then
-        if [ "${DRY_RUN}" != true ]; then
-            ((PATCHED_COUNT++))
-        fi
-    else
-        FAILED_DEPLOYMENTS+=("${CR_NAME}")
-    fi
-done
 
 echo ""
 echo -e "${BOLD}==========================================${NC}"
 echo -e "${BOLD}GuardrailsOrchestrator Deployment Patch Summary${NC}"
-echo -e "${BOLD}==========================================${NC}"
-echo -e "Total GuardrailsOrchestrator CRs found: ${BLUE}${#GORCH_CR_ARRAY[@]}${NC}"
-echo -e "Successfully patched: ${GREEN}${PATCHED_COUNT}${NC}"
-echo -e "Failed: ${RED}${#FAILED_DEPLOYMENTS[@]}${NC}"
+echo -e "${BOLD}=========================================${NC}"
+
 if [ "${DRY_RUN}" = true ]; then
     echo -e "${CYAN}(DRY-RUN: no changes were made)${NC}"
-fi
-
-if [ ${#FAILED_DEPLOYMENTS[@]} -gt 0 ]; then
-    echo -e "${RED}Failed deployments: ${CYAN}${FAILED_DEPLOYMENTS[*]}${NC}"
+elif [ ${#FAILED_DEPLOYMENTS[@]} -gt 0 ]; then
+    echo -e "${RED}FAIL: ${CYAN}${FAILED_DEPLOYMENTS[*]}${NC}"
     exit 1
+else
+    echo -e "${GREEN}OK: ${CYAN}${GORCH_NAME}${GREEN} patched successfully!${NC}"
 fi
-
-echo -e "${GREEN}All guardrails deployments patched successfully!${NC}"
