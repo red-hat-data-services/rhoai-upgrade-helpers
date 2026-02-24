@@ -12,10 +12,13 @@
 # Stop all affected workbenches before patching to avoid data loss or
 # disruption to users, and start them again afterwards.
 #
-# Commands:
-#   patch    - Patch notebook resources for 3.x auth model
-#   cleanup  - Remove stale OAuth routes, secrets, and OAuthClients
-#   verify   - Verify migration and/or cleanup status
+# Main workflow commands (run in order: patch → verify → cleanup):
+#   patch             - Patch notebook resources for 3.x auth model
+#   verify            - Verify migration and/or cleanup status
+#   cleanup           - Remove stale OAuth routes, secrets, and OAuthClients
+#
+# Troubleshooting commands (run only if odh-cli pre-check fails for kueue label on notebook):
+#   attach-kueue-label - Add kueue queue-name label to notebooks in kueue-managed namespaces
 #
 # Examples:
 #   ./workbench-2.x-to-3.x-upgrade.sh patch   --name my-wb --namespace my-ns
@@ -33,13 +36,19 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") <command> [options]
 
-Commands:
-  patch    Patch notebook CR for the 3.x auth model (removes oauth-proxy
-           sidecar, adds inject-auth annotation, deletes StatefulSet).
-           WARNING: This causes running workbenches to restart. Stop them first.
-  cleanup  Remove leftover OAuth resources (Route, Service, Secrets,
-           OAuthClient) that are no longer needed after migration.
-  verify   Check migration and/or cleanup state.
+Main workflow commands (run in order: patch → verify → cleanup):
+  patch             Patch notebook CR for the 3.x auth model (removes oauth-proxy
+                    sidecar, adds inject-auth annotation, deletes StatefulSet).
+                    WARNING: This causes running workbenches to restart. Stop them first.
+  verify            Check migration and/or cleanup state.
+  cleanup           Remove leftover OAuth resources (Route, Services, Secrets,
+                    OAuthClient) that are no longer needed after migration.
+
+Troubleshooting commands (run only if odh-cli pre-check fails for kueue label on notebook):
+  attach-kueue-label Add 'kueue.x-k8s.io/queue-name' label to notebooks in
+                    kueue-managed namespaces. Skips notebooks that already
+                    have the label. Use --queue-name to specify a custom value
+                    (default: 'default').
 
 Options:
   --name NAME              Notebook name   (required for single-workbench mode)
@@ -48,15 +57,20 @@ Options:
   --phase PHASE            Verify phase: migration|cleanup|all (verify command only;
                            default: migration)
   -y, --yes                Skip confirmation prompts (for automation / CI)
+  --queue-name NAME        Queue name value for attach-kueue-label (default: 'default')
 
 One of "--name NAME --namespace NAMESPACE" or "--all" must be provided.
 
-Examples:
+Examples (main workflow):
   $(basename "$0") patch   --name my-wb --namespace my-ns
   $(basename "$0") cleanup --all
   $(basename "$0") verify  --name my-wb --namespace my-ns
   $(basename "$0") verify  --all
   $(basename "$0") verify  --all --phase cleanup
+
+Examples (troubleshooting - only if odh-cli pre-check fails for kueue label on notebook):
+  $(basename "$0") attach-kueue-label --all
+  $(basename "$0") attach-kueue-label --all --queue-name my-queue
 EOF
     exit 1
 }
@@ -520,6 +534,55 @@ verify_workbench() {
     echo ""
 }
 
+# Check if a namespace has the kueue.openshift.io/managed label set to 'true'.
+#   $1 = namespace
+# Returns:
+#   0 -> namespace is kueue-managed
+#   1 -> namespace is NOT kueue-managed
+is_namespace_kueue_managed() {
+    local namespace="$1"
+    local managed_label
+
+    managed_label=$(oc get namespace "$namespace" \
+        -o jsonpath='{.metadata.labels.kueue\.openshift\.io/managed}' 2>/dev/null)
+
+    if [ "$managed_label" = "true" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Add kueue queue-name label to a notebook if missing.
+#   $1 = notebook name
+#   $2 = namespace
+patch_kueue_label_workbench() {
+    local name="$1"
+    local namespace="$2"
+
+    # First check if the namespace is kueue-managed
+    if ! is_namespace_kueue_managed "$namespace"; then
+        echo "  Skipping '$name' in '$namespace' — namespace is not kueue-managed."
+        return 0
+    fi
+
+    # Check if the notebook already has the kueue.x-k8s.io/queue-name label
+    local queue_label
+    queue_label=$(oc get notebook "$name" -n "$namespace" \
+        -o jsonpath='{.metadata.labels.kueue\.x-k8s\.io/queue-name}' 2>/dev/null)
+
+    if [ -n "$queue_label" ]; then
+        echo "  Notebook '$name' in '$namespace' already has queue-name label: '$queue_label' — skipping."
+        return 0
+    fi
+
+    echo "  Patching notebook '$name' in '$namespace' with kueue queue-name label..."
+    oc label notebook "$name" -n "$namespace" \
+        "kueue.x-k8s.io/queue-name=$QUEUE_NAME" --overwrite
+
+    echo "  Label 'kueue.x-k8s.io/queue-name=$QUEUE_NAME' applied to '$name'."
+}
+
 # ──────────────────────────────────────────────
 # Batch helper — run a function for every notebook
 # ──────────────────────────────────────────────
@@ -564,6 +627,7 @@ SKIP_CONFIRM=false
 VERIFY_PHASE="migration"
 NAME=""
 NAMESPACE=""
+QUEUE_NAME="default"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -586,6 +650,10 @@ while [ $# -gt 0 ]; do
         -y|--yes)
             SKIP_CONFIRM=true
             shift
+            ;;
+        --queue-name)
+            QUEUE_NAME="$2"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -651,6 +719,15 @@ case "$COMMAND" in
         else
             verify_workbench "$NAME" "$NAMESPACE"
         fi
+        ;;
+    attach-kueue-label)
+        echo "=== Patching kueue queue-name labels ==="
+        if [ "$ALL" = true ]; then
+            process_all patch_kueue_label_workbench
+        else
+            patch_kueue_label_workbench "$NAME" "$NAMESPACE"
+        fi
+        echo "=== Kueue label patching complete ==="
         ;;
     *)
         echo "Error: Unknown command '$COMMAND'"
