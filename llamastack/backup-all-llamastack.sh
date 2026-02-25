@@ -133,8 +133,9 @@ echo "$LLSD_LIST" | jq -c '.items[]' | while read -r llsd; do
             mkdir -p "$LLSD_DIR/pod-data"
             chmod 700 "$LLSD_DIR/pod-data"
 
-            # Use oc rsync to copy the data
-            if oc rsync -n "$NAMESPACE" "$POD_NAME:/opt/app-root/src/.llama/distributions/rh/" "$LLSD_DIR/pod-data/" --delete=false; then
+            # --warning=no-file-changed --ignore-failed-read prevents tar from a non zero exit if
+            # sqlite data changed during read, the db remain readable
+            if oc exec -n "$NAMESPACE" "$POD_NAME" -c llama-stack -- tar --warning=no-file-changed --ignore-failed-read -czf - -C /opt/app-root/src/.llama/distributions/rh . | tar -xzf - -C "$LLSD_DIR/pod-data"; then
                 # Set restrictive permissions on all backed up files and directories
                 find "$LLSD_DIR/pod-data" -type f -exec chmod 600 {} +
                 find "$LLSD_DIR/pod-data" -type d -exec chmod 700 {} +
