@@ -384,6 +384,14 @@ patch_workbench() {
     local namespace="$2"
 
     echo "Patching notebook '$name' in namespace '$namespace'..."
+    if [ "$SKIP_STOP" = true ] && is_namespace_kueue_managed "$namespace"; then
+        echo "  WARNING: Kueue Finalizer Conflicts risk detected for '$name' in '$namespace'."
+        echo "           With --skip-stop, running workbenches in Kueue-managed namespaces"
+        echo "           can leave pods stuck in Terminating during upgrade because the"
+        echo "           Kueue webhook may fail to reconcile the workload."
+        echo "           If this happens, stop the workbench in Dashboard or remove"
+        echo "           finalizer 'kueue.x-k8s.io/managed' from the affected pod."
+    fi
 
     # Generate the JSON Patch dynamically from the current notebook state
     PATCH=$(oc get notebook "$name" -n "$namespace" -o json | jq -c '
