@@ -163,9 +163,10 @@ confirm_patch() {
 ║   - Strip legacy OAuth-proxy configuration                     ║
 ║                                                                ║
 ║  BEFORE PROCEEDING, make sure you have:                        ║
-║   1. Stopped all affected workbenches                          ║
-║   2. Verified you are connected to the correct cluster         ║
-║   3. Backed up any critical notebook CRs if needed             ║
+║   1. Notified RHOAI users to save all their data inside        ║
+║      the workbenches                                           ║
+║   2. Stopped all affected workbenches                          ║
+║   3. Verified you are connected to the correct cluster         ║
 ║                                                                ║
 ║  RISK: Running this on active workbenches may cause DATA LOSS  ║
 ║  or DISRUPTION to users.                                       ║
@@ -185,9 +186,10 @@ EOF
 ║   - Strip legacy OAuth-proxy configuration                     ║
 ║                                                                ║
 ║  BEFORE PROCEEDING, make sure you have:                        ║
-║   1. Stopped all affected workbenches                          ║
-║   2. Verified you are connected to the correct cluster         ║
-║   3. Backed up any critical notebook CRs if needed             ║
+║   1. Notified RHOAI users to save all their data inside        ║
+║      the workbenches                                           ║
+║   2. Stopped all affected workbenches                          ║
+║   3. Verified you are connected to the correct cluster         ║
 ║                                                                ║
 ║  RISK: Running this on active workbenches may cause DATA LOSS  ║
 ║  or DISRUPTION to users.                                       ║
