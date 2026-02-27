@@ -509,8 +509,7 @@ cleanup_workbench() {
     echo "[1/4] Ensuring Route is removed..."
     delete_resource_if_present route "$name" "$namespace"
 
-    echo "[2/4] Ensuring Services are removed..."
-    delete_resource_if_present service "$name" "$namespace"
+    echo "[2/4] Ensuring Service is removed..."
     delete_resource_if_present service "${name}-tls" "$namespace"
 
     echo "[3/4] Ensuring Secrets are removed..."
