@@ -259,6 +259,32 @@ ask_cleanup_continue_or_skip() {
     return 1
 }
 
+# Delete a resource only when it exists, and report accurate status.
+#   $1 = kind
+#   $2 = name
+#   $3 = namespace (optional for cluster-scoped resources)
+delete_resource_if_present() {
+    local kind="$1"
+    local name="$2"
+    local namespace="${3:-}"
+
+    if [ -n "$namespace" ]; then
+        if oc get "$kind" "$name" -n "$namespace" >/dev/null 2>&1; then
+            oc delete "$kind" "$name" -n "$namespace" >/dev/null
+            echo "  Deleted ${kind}/${name} in namespace '${namespace}'."
+        else
+            echo "  Already absent: ${kind}/${name} in namespace '${namespace}'."
+        fi
+    else
+        if oc get "$kind" "$name" >/dev/null 2>&1; then
+            oc delete "$kind" "$name" >/dev/null
+            echo "  Deleted ${kind}/${name}."
+        else
+            echo "  Already absent: ${kind}/${name}."
+        fi
+    fi
+}
+
 # ──────────────────────────────────────────────
 # Core functions (single workbench)
 # ──────────────────────────────────────────────
@@ -480,17 +506,19 @@ cleanup_workbench() {
         fi
     fi
 
-    echo "[1/4] Removing Route..."
-    oc delete route "$name" -n "$namespace" --ignore-not-found
+    echo "[1/4] Ensuring Route is removed..."
+    delete_resource_if_present route "$name" "$namespace"
 
-    echo "[2/4] Removing Service..."
-    oc delete service "$name" "${name}-tls" -n "$namespace" --ignore-not-found
+    echo "[2/4] Ensuring Service is removed..."
+    delete_resource_if_present service "${name}-tls" "$namespace"
 
-    echo "[3/4] Removing Secrets..."
-    oc delete secret "${name}-oauth-client" "${name}-oauth-config" "${name}-tls" -n "$namespace" --ignore-not-found
+    echo "[3/4] Ensuring Secrets are removed..."
+    delete_resource_if_present secret "${name}-oauth-client" "$namespace"
+    delete_resource_if_present secret "${name}-oauth-config" "$namespace"
+    delete_resource_if_present secret "${name}-tls" "$namespace"
 
-    echo "[4/4] Removing OAuthClient: ${name}-${namespace}-oauth-client"
-    oc delete oauthclient "${name}-${namespace}-oauth-client" --ignore-not-found
+    echo "[4/4] Ensuring OAuthClient is removed..."
+    delete_resource_if_present oauthclient "${name}-${namespace}-oauth-client"
 
     echo "=========================================================="
     echo " Cleanup complete for '$name' in '$namespace'."
