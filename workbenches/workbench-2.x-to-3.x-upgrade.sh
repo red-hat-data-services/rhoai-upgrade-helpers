@@ -147,6 +147,7 @@ patch_exit_handler() {
         echo ""
         rm -f "$STOPPED_BY_SCRIPT"
     fi
+    rm -f "${KUEUE_WORKBENCHES_TO_CHECK:-}"
     return "$exit_code"
 }
 
@@ -417,13 +418,10 @@ patch_workbench() {
     local namespace="$2"
 
     echo "Patching notebook '$name' in namespace '$namespace'..."
+
+    # Track workbenches in Kueue-managed namespaces for post-patch check
     if [ "$SKIP_STOP" = true ] && is_namespace_kueue_managed "$namespace"; then
-        echo "  WARNING: Kueue Finalizer Conflicts risk detected for '$name' in '$namespace'."
-        echo "           With --skip-stop, running workbenches in Kueue-managed namespaces"
-        echo "           can leave pods stuck in Terminating during upgrade because the"
-        echo "           Kueue webhook may fail to reconcile the workload."
-        echo "           If this happens, stop the workbench in Dashboard or remove"
-        echo "           finalizer 'kueue.x-k8s.io/managed' from the affected pod."
+        echo "$name $namespace" >> "$KUEUE_WORKBENCHES_TO_CHECK"
     fi
 
     # Generate the JSON Patch dynamically from the current notebook state
@@ -781,6 +779,70 @@ is_namespace_kueue_managed() {
     fi
 }
 
+# Check if a notebook's pod is stuck in Terminating state.
+#   $1 = notebook name
+#   $2 = namespace
+# Returns:
+#   0 -> pod is in Terminating state
+#   1 -> pod is NOT in Terminating state (or doesn't exist)
+is_pod_terminating() {
+    local name="$1"
+    local namespace="$2"
+    local deletion_timestamp
+
+    # Check if the pod exists and has a deletionTimestamp (indicating Terminating)
+    deletion_timestamp=$(oc get pod "${name}-0" -n "$namespace" \
+        -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null)
+
+    if [ -n "$deletion_timestamp" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Check tracked Kueue workbenches for pods stuck in Terminating state and warn.
+# Reads from $KUEUE_WORKBENCHES_TO_CHECK file.
+check_kueue_pods_terminating() {
+    if [ ! -s "$KUEUE_WORKBENCHES_TO_CHECK" ]; then
+        return 0
+    fi
+
+    local stuck_pods=()
+
+    # Wait a few seconds to allow pods to start terminating
+    sleep 3
+
+    while read -r wb_name wb_namespace; do
+        if is_pod_terminating "$wb_name" "$wb_namespace"; then
+            stuck_pods+=("$wb_name $wb_namespace")
+        fi
+    done < "$KUEUE_WORKBENCHES_TO_CHECK"
+
+    if [ ${#stuck_pods[@]} -gt 0 ]; then
+        echo ""
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║  WARNING: Kueue Finalizer Conflicts detected                   ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "  The following pods are stuck in Terminating state:"
+        for entry in "${stuck_pods[@]}"; do
+            local pod_name pod_ns
+            pod_name=$(echo "$entry" | awk '{print $1}')
+            pod_ns=$(echo "$entry" | awk '{print $2}')
+            echo "    - ${pod_name}-0 (namespace: $pod_ns)"
+        done
+        echo ""
+        echo "  This happens because the Kueue webhook may fail to reconcile"
+        echo "  the workload when --skip-stop is used with running workbenches"
+        echo "  in Kueue-managed namespaces."
+        echo ""
+        echo "  To resolve, remove the finalizer from the affected pod:"
+        echo "    oc patch pod <pod-name> -n <namespace> -p '{\"metadata\":{\"finalizers\":null}}' --type=merge"
+        echo ""
+    fi
+}
+
 # Add kueue queue-name label to a notebook if missing.
 #   $1 = notebook name
 #   $2 = namespace
@@ -1051,6 +1113,8 @@ case "$COMMAND" in
         # Temp file that tracks workbenches we stopped (so we can restart them).
         # Written to by stop_workbench(), read after patching.
         STOPPED_BY_SCRIPT=$(mktemp)
+        # Temp file that tracks workbenches in Kueue-managed namespaces (for post-patch check).
+        KUEUE_WORKBENCHES_TO_CHECK=$(mktemp)
         trap 'patch_exit_handler' EXIT
 
         if [ "$SKIP_STOP" = false ]; then
@@ -1090,7 +1154,10 @@ case "$COMMAND" in
             fi
         fi
 
-        rm -f "$STOPPED_BY_SCRIPT"
+        # Check for pods stuck in Terminating state in Kueue-managed namespaces
+        check_kueue_pods_terminating
+
+        rm -f "$STOPPED_BY_SCRIPT" "$KUEUE_WORKBENCHES_TO_CHECK"
         trap - EXIT
         ;;
     cleanup)
