@@ -22,6 +22,7 @@
 # Main workflow commands (run in order: patch → verify → cleanup):
 #   list              - Identify legacy / migrated / invalid workbenches
 #   patch             - Patch notebook resources for 3.x auth model
+#                       (use --with-cleanup to run cleanup immediately after patch)
 #   verify            - Verify migration and/or cleanup status
 #   cleanup           - Remove stale OAuth routes, secrets, and OAuthClients
 #
@@ -56,6 +57,7 @@ Main workflow commands (run in order: patch → verify → cleanup):
                     As a safety net, any still-running workbench is stopped
                     automatically before patching and restarted afterwards.
                     Use --skip-stop to disable this automatic stop/restart.
+                    Use --with-cleanup to run cleanup automatically after patch.
   verify            Check migration and/or cleanup state.
   cleanup           Remove leftover OAuth resources (Route, Service, Secrets,
                     OAuthClient) that are no longer needed after migration.
@@ -75,6 +77,8 @@ Options:
   --skip-stop              Skip the automatic stop/restart of workbenches before
                            and after patching (use only if you are managing the
                            workbench lifecycle manually)
+  --with-cleanup           Run cleanup automatically after a successful patch
+                           (patch command only)
   -y, --yes                Skip confirmation prompts (for automation / CI)
   --queue-name NAME        Queue name value for attach-kueue-label (default: 'default')
 
@@ -83,6 +87,7 @@ One of "--name NAME --namespace NAMESPACE" or "--all" must be provided.
 Examples (main workflow):
   $(basename "$0") list    --all
   $(basename "$0") patch   --name my-wb --namespace my-ns
+  $(basename "$0") patch   --name my-wb --namespace my-ns --with-cleanup
   $(basename "$0") patch   --all --skip-stop
   $(basename "$0") cleanup --all
   $(basename "$0") verify  --name my-wb --namespace my-ns
@@ -909,6 +914,7 @@ ALL=false
 SKIP_CONFIRM=false
 VERIFY_PHASE="migration"
 SKIP_STOP=false
+WITH_CLEANUP=false
 NAME=""
 NAMESPACE=""
 QUEUE_NAME="default"
@@ -933,6 +939,10 @@ while [ $# -gt 0 ]; do
             ;;
         --skip-stop)
             SKIP_STOP=true
+            shift
+            ;;
+        --with-cleanup)
+            WITH_CLEANUP=true
             shift
             ;;
         -y|--yes)
@@ -968,6 +978,11 @@ fi
 
 if [ "$COMMAND" != "verify" ] && [ "$VERIFY_PHASE" != "migration" ]; then
     echo "Error: --phase is only supported with the verify command."
+    usage
+fi
+
+if [ "$COMMAND" != "patch" ] && [ "$WITH_CLEANUP" = true ]; then
+    echo "Error: --with-cleanup is only supported with the patch command."
     usage
 fi
 
@@ -1025,6 +1040,16 @@ case "$COMMAND" in
                 restart_workbench "$wb_name" "$wb_namespace"
             done < "$STOPPED_BY_SCRIPT"
             echo ""
+        fi
+
+        if [ "$WITH_CLEANUP" = true ]; then
+            echo "=== Running cleanup after patch (--with-cleanup) ==="
+            confirm_cleanup
+            if [ "$ALL" = true ]; then
+                process_all cleanup_workbench
+            else
+                cleanup_workbench "$NAME" "$NAMESPACE"
+            fi
         fi
 
         rm -f "$STOPPED_BY_SCRIPT"
