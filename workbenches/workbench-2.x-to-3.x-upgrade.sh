@@ -950,7 +950,7 @@ patch_kueue_label_workbench() {
 list_workbench() {
     local name="$1"
     local namespace="$2"
-    local inject_oauth inject_auth containers status
+    local inject_oauth inject_auth containers status stopped_annotation state
     local has_kube_rbac_proxy=false has_oauth_proxy=false
 
     inject_oauth=$(oc get notebook "$name" -n "$namespace" \
@@ -959,11 +959,37 @@ list_workbench() {
         -o jsonpath='{.metadata.annotations.notebooks\.opendatahub\.io/inject-auth}' 2>/dev/null)
     containers=$(oc get notebook "$name" -n "$namespace" \
         -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
+    stopped_annotation=$(oc get notebook "$name" -n "$namespace" \
+        -o jsonpath='{.metadata.annotations.kubeflow-resource-stopped}' 2>/dev/null)
 
     echo "$containers" | grep -q "kube-rbac-proxy" && has_kube_rbac_proxy=true
     echo "$containers" | grep -q "oauth-proxy" && has_oauth_proxy=true
 
+    # Determine running state
+    if [ -n "$stopped_annotation" ]; then
+        state="Stopped (since $stopped_annotation)"
+    else
+        if oc get pod "${name}-0" -n "$namespace" >/dev/null 2>&1; then
+            local pod_phase
+            pod_phase=$(oc get pod "${name}-0" -n "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null)
+            case "$pod_phase" in
+                Running)
+                    state="Running"
+                    ;;
+                Pending)
+                    state="Starting (pod pending)"
+                    ;;
+                *)
+                    state="$pod_phase"
+                    ;;
+            esac
+        else
+            state="Starting (no pod yet)"
+        fi
+    fi
+
     echo "=== Notebook: $name  (namespace: $namespace) ==="
+    echo "  State:                   $state"
     echo "  inject-oauth annotation: ${inject_oauth:-<not set>}"
     echo "  inject-auth  annotation: ${inject_auth:-<not set>}"
     echo "  kube-rbac-proxy sidecar: $has_kube_rbac_proxy"
@@ -998,6 +1024,7 @@ list_workbench() {
 # and print a summary table. Uses a single API call for efficiency.
 list_all_workbenches() {
     local json total legacy=0 migrated=0 invalid=0 unknown=0 unreconciled=0
+    local running=0 stopped=0 starting=0
 
     json=$(oc get notebooks --all-namespaces -o json 2>/dev/null)
     total=$(echo "$json" | jq '.items | length')
@@ -1010,15 +1037,43 @@ list_all_workbenches() {
     echo ""
     echo "Scanning all notebooks on the cluster..."
     echo ""
-    printf "  %-40s %-30s %s\n" "NAME" "NAMESPACE" "STATUS"
-    printf "  %-40s %-30s %s\n" "----" "---------" "------"
+    printf "  %-40s %-30s %-12s %s\n" "NAME" "NAMESPACE" "STATE" "STATUS"
+    printf "  %-40s %-30s %-12s %s\n" "----" "---------" "-----" "------"
 
-    while IFS='|' read -r nb_name nb_namespace oauth auth containers; do
-        local status
+    while IFS='|' read -r nb_name nb_namespace oauth auth containers stopped_annotation; do
+        local status state
         local has_kube_rbac_proxy=false has_oauth_proxy=false
 
         echo "$containers" | grep -q "kube-rbac-proxy" && has_kube_rbac_proxy=true
         echo "$containers" | grep -q "oauth-proxy" && has_oauth_proxy=true
+
+        # Determine running state based on kubeflow-resource-stopped annotation and pod existence
+        if [ -n "$stopped_annotation" ]; then
+            state="Stopped"
+            stopped=$((stopped + 1))
+        else
+            # Check if pod exists for this notebook
+            if oc get pod "${nb_name}-0" -n "$nb_namespace" >/dev/null 2>&1; then
+                local pod_phase
+                pod_phase=$(oc get pod "${nb_name}-0" -n "$nb_namespace" -o jsonpath='{.status.phase}' 2>/dev/null)
+                case "$pod_phase" in
+                    Running)
+                        state="Running"
+                        running=$((running + 1))
+                        ;;
+                    Pending)
+                        state="Starting"
+                        starting=$((starting + 1))
+                        ;;
+                    *)
+                        state="$pod_phase"
+                        ;;
+                esac
+            else
+                state="Starting"
+                starting=$((starting + 1))
+            fi
+        fi
 
         # Primary: sidecar-based status detection
         if [ "$has_kube_rbac_proxy" = true ] && [ "$has_oauth_proxy" = true ]; then
@@ -1046,23 +1101,31 @@ list_all_workbenches() {
             status="UNKNOWN"
             unknown=$((unknown + 1))
         fi
-        printf "  %-40s %-30s %s\n" "$nb_name" "$nb_namespace" "$status"
+        printf "  %-40s %-30s %-12s %s\n" "$nb_name" "$nb_namespace" "$state" "$status"
     done < <(echo "$json" | jq -r '.items[] | [
         .metadata.name,
         .metadata.namespace,
         (.metadata.annotations["notebooks.opendatahub.io/inject-oauth"] // ""),
         (.metadata.annotations["notebooks.opendatahub.io/inject-auth"] // ""),
-        ([.spec.template.spec.containers[].name] | join(" "))
+        ([.spec.template.spec.containers[].name] | join(" ")),
+        (.metadata.annotations["kubeflow-resource-stopped"] // "")
     ] | join("|")')
 
     echo ""
     echo "Summary:"
     echo "  Total notebooks:  $total"
-    echo "  Legacy (2.x):     $legacy"
-    echo "  Migrated (3.x):   $migrated"
-    echo "  Unreconciled:     $unreconciled"
-    echo "  Invalid state:    $invalid"
-    echo "  Unknown:          $unknown"
+    echo ""
+    echo "  Migration status:"
+    echo "    Legacy (2.x):     $legacy"
+    echo "    Migrated (3.x):   $migrated"
+    echo "    Unreconciled:     $unreconciled"
+    echo "    Invalid state:    $invalid"
+    echo "    Unknown:          $unknown"
+    echo ""
+    echo "  Running state:"
+    echo "    Running:          $running"
+    echo "    Stopped:          $stopped"
+    echo "    Starting:         $starting"
     echo ""
 
     if [ "$legacy" -gt 0 ]; then
