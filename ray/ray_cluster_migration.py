@@ -1580,33 +1580,46 @@ def _post_upgrade_from_backup(
                 body=doc,
             )
 
-            # Wait for cluster to become ready
-            print(f"  [{name}] Waiting for cluster to become ready...")
-            cluster_ready = _wait_for_cluster_ready(
-                api_instance, core_api, name, ns, timeout_seconds=300
-            )
+            # Check if cluster is suspended - suspended clusters don't need readiness check
+            is_suspended = doc.get("spec", {}).get("suspend", False)
 
-            if cluster_ready:
-                # Cluster is ready, get the route URL
-                route_url = _get_cluster_route(api_instance, name, ns)
-                if route_url:
-                    print(f"  [OK] Restored from backup: {name} (ns: {ns})")
-                    print(f"       Dashboard: {route_url}")
-                else:
-                    print(f"  [OK] Restored from backup: {name} (ns: {ns})")
-                    print(f"       Dashboard: Route not yet available (check later)")
+            if is_suspended:
+                # Suspended clusters don't have pods, so skip pod readiness check
+                print(f"  [OK] Restored from backup: {name} (ns: {ns}) [SUSPENDED]")
+                print(f"       Note: Suspended clusters may become active after restore.")
+                print(f"       Verify cluster state and re-suspend if needed.")
                 if not dry_run:
                     _remove_pre_upgrade_backup_annotation(api_instance, name, ns)
                 migrated_count += 1
                 successfully_migrated.append({"name": name, "namespace": ns})
             else:
-                failed_count += 1
-                print(
-                    f"  [FAIL] {name} (ns: {ns}) - did not become ready within 5 minutes"
-                )
-                print(
-                    f"       Please check this cluster (and any others that timed out) and revisit as needed."
-                )
+                # Wait for route to be available (indicates operator has reconciled)
+                print(f"  [{name}] Waiting for route to become available...")
+                route_url = None
+                route_timeout = 90  # seconds
+                route_poll_interval = 5
+                route_elapsed = 0
+
+                while route_elapsed < route_timeout:
+                    route_url = _get_cluster_route(api_instance, name, ns)
+                    if route_url:
+                        break
+                    time.sleep(route_poll_interval)
+                    route_elapsed += route_poll_interval
+
+                if route_url:
+                    print(f"  [OK] Restored from backup: {name} (ns: {ns})")
+                    print(f"       Dashboard: {route_url}")
+                    print(f"       Pods will become ready when quota/resources are available.")
+                else:
+                    print(f"  [OK] Restored from backup: {name} (ns: {ns})")
+                    print(f"       Dashboard: Route not yet available (check later)")
+                    print(f"       Pods will become ready when quota/resources are available.")
+
+                if not dry_run:
+                    _remove_pre_upgrade_backup_annotation(api_instance, name, ns)
+                migrated_count += 1
+                successfully_migrated.append({"name": name, "namespace": ns})
 
         except Exception as e:
             print(f"  [FAIL] {name} (ns: {ns}): {e}")
@@ -1623,7 +1636,7 @@ def _post_upgrade_from_backup(
     print(f"  Failed: {failed_count}")
     if failed_count:
         print(
-            "  Failed clusters include those that did not become ready within 5 min — please verify status and revisit as needed."
+            "  Please verify failed clusters and revisit as needed."
         )
 
     return {"restored": migrated_count, "skipped": 0, "failed": failed_count}
@@ -1968,6 +1981,9 @@ def post_upgrade(
                 print(
                     "WARNING: You are about to migrate ALL clusters across ALL namespaces"
                 )
+            print(
+                "Ensure the upgraded RHOAI dashboard is fully rolled out and available."
+            )
             print("=" * 60)
 
         print(f"\nThe following {len(to_migrate)} cluster(s) will be migrated:")
@@ -1978,11 +1994,17 @@ def post_upgrade(
             "\nIMPORTANT: Migration will cause temporary downtime for each RayCluster."
         )
         print(
-            "  - Pods will be restarted as the KubeRay operator recreates them with the new configuration."
+            "  - Pods will be restarted as the KubeRay operator recreates them with the updated configuration."
         )
         print("  - Existing job state and logs will be lost.")
         print(
             "  - Currently running workloads/jobs will be interrupted and progress lost."
+        )
+        print(
+            "  - Kueue-managed suspended RayClusters may become active after migration, potentially"
+        )
+        print(
+            "    affecting quota. Re-suspend workloads manually if needed."
         )
 
         if not _confirm("\nProceed with migration? (yes/no): ", auto_confirm):
@@ -2084,38 +2106,41 @@ def post_upgrade(
             if is_suspended:
                 # Suspended clusters don't have pods, so skip pod readiness check
                 # Route will be created by the operator when the cluster is unsuspended
-                print(f"  [OK] Migrated: {name} (ns: {ns}) [SUSPENDED - no pod readiness check needed]")
+                print(f"  [OK] Migrated: {name} (ns: {ns}) [SUSPENDED]")
+                print(f"       Note: Suspended clusters may become active after migration.")
+                print(f"       Verify cluster state and re-suspend if needed.")
                 if not dry_run:
                     _remove_pre_upgrade_backup_annotation(api_instance, name, ns)
                 migrated_count += 1
                 successfully_migrated.append({"name": name, "namespace": ns})
             else:
-                print(f"  [{name}] Waiting for cluster to become ready...")
-                cluster_ready = _wait_for_cluster_ready(
-                    api_instance, core_api, name, ns, timeout_seconds=300
-                )
+                # Wait for route to be available (indicates operator has reconciled)
+                print(f"  [{name}] Waiting for route to become available...")
+                route_url = None
+                route_timeout = 90  # seconds
+                route_poll_interval = 5
+                route_elapsed = 0
 
-                if cluster_ready:
-                    # Cluster is ready, get the route URL
+                while route_elapsed < route_timeout:
                     route_url = _get_cluster_route(api_instance, name, ns)
                     if route_url:
-                        print(f"  [OK] Migrated: {name} (ns: {ns})")
-                        print(f"       Dashboard: {route_url}")
-                    else:
-                        print(f"  [OK] Migrated: {name} (ns: {ns})")
-                        print(f"       Dashboard: Route not yet available (check later)")
-                    if not dry_run:
-                        _remove_pre_upgrade_backup_annotation(api_instance, name, ns)
-                    migrated_count += 1
-                    successfully_migrated.append({"name": name, "namespace": ns})
+                        break
+                    time.sleep(route_poll_interval)
+                    route_elapsed += route_poll_interval
+
+                if route_url:
+                    print(f"  [OK] Migrated: {name} (ns: {ns})")
+                    print(f"       Dashboard: {route_url}")
+                    print(f"       Pods will become ready when quota/resources are available.")
                 else:
-                    failed_count += 1
-                    print(
-                        f"  [FAIL] {name} (ns: {ns}) - did not become ready within 5 minutes"
-                    )
-                    print(
-                        f"       Please check this cluster (and any others that timed out) and revisit as needed."
-                    )
+                    print(f"  [OK] Migrated: {name} (ns: {ns})")
+                    print(f"       Dashboard: Route not yet available (check later)")
+                    print(f"       Pods will become ready when quota/resources are available.")
+
+                if not dry_run:
+                    _remove_pre_upgrade_backup_annotation(api_instance, name, ns)
+                migrated_count += 1
+                successfully_migrated.append({"name": name, "namespace": ns})
 
         except Exception as e:
             print(f"  [FAIL] {name} (ns: {ns}): {e}")
@@ -2133,7 +2158,7 @@ def post_upgrade(
     print(f"  Failed: {failed_count}")
     if failed_count:
         print(
-            "  Failed clusters include those that did not become ready within 5 min — please verify status and revisit as needed."
+            "  Please verify failed clusters and revisit as needed."
         )
 
     return {
@@ -2257,7 +2282,7 @@ def list_ray_clusters(
     else:
         print(f"RayCluster Migration Status:\n")
         print(
-            f"{'Name':<25} {'Namespace':<18} {'Status':<12} {'Workers':<8} {'Migration Status':<30}"
+            f"{'RayCluster Name':<25} {'Namespace':<18} {'Status':<12} {'Workers':<8} {'Migration Status':<30}"
         )
         print("-" * 100)
 
