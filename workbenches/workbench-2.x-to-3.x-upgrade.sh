@@ -620,7 +620,38 @@ check_workbench_migration() {
         pass=false
     fi
 
-    # Check inject-oauth annotation (should NOT exist)
+    # Check sidecar containers first (needed for inject-oauth check)
+    CONTAINERS=$(oc get notebook "$name" -n "$namespace" \
+        -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
+
+    local has_kube_rbac_proxy=false
+    local has_oauth_proxy=false
+
+    if echo "$CONTAINERS" | grep -q "kube-rbac-proxy"; then
+        has_kube_rbac_proxy=true
+        if [ "$verbose" = true ]; then
+            echo "  PASS: kube-rbac-proxy sidecar container present (RHOAI 3.x)"
+        fi
+    else
+        if [ "$verbose" = true ]; then
+            echo "  FAIL: kube-rbac-proxy sidecar container missing"
+        fi
+        pass=false
+    fi
+
+    if echo "$CONTAINERS" | grep -q "oauth-proxy"; then
+        has_oauth_proxy=true
+        if [ "$verbose" = true ]; then
+            echo "  FAIL: Legacy oauth-proxy sidecar still present (RHOAI 2.x)"
+        fi
+        pass=false
+    else
+        if [ "$verbose" = true ]; then
+            echo "  PASS: Legacy oauth-proxy sidecar removed"
+        fi
+    fi
+
+    # Check inject-oauth annotation (only a failure if kube-rbac-proxy is missing or oauth-proxy still exists)
     OAUTH=$(oc get notebook "$name" -n "$namespace" \
         -o jsonpath='{.metadata.annotations.notebooks\.opendatahub\.io/inject-oauth}' 2>/dev/null)
     if [ -z "$OAUTH" ]; then
@@ -628,10 +659,17 @@ check_workbench_migration() {
             echo "  PASS: Legacy inject-oauth annotation removed"
         fi
     else
-        if [ "$verbose" = true ]; then
-            echo "  FAIL: Legacy inject-oauth annotation still exists: '$OAUTH'"
+        # Annotation exists - only considered migrated if kube-rbac-proxy is set AND oauth-proxy is removed
+        if [ "$has_kube_rbac_proxy" = true ] && [ "$has_oauth_proxy" = false ]; then
+            if [ "$verbose" = true ]; then
+                echo "  WARN: Legacy inject-oauth annotation still exists: '$OAUTH' (but kube-rbac-proxy is set, considered migrated)"
+            fi
+        else
+            if [ "$verbose" = true ]; then
+                echo "  FAIL: Legacy inject-oauth annotation still exists: '$OAUTH'"
+            fi
+            pass=false
         fi
-        pass=false
     fi
 
     # Check that --ServerApp.tornado_settings is removed from NOTEBOOK_ARGS
@@ -645,32 +683,6 @@ check_workbench_migration() {
     else
         if [ "$verbose" = true ]; then
             echo "  PASS: --ServerApp.tornado_settings removed from NOTEBOOK_ARGS"
-        fi
-    fi
-
-    # Check sidecar containers
-    CONTAINERS=$(oc get notebook "$name" -n "$namespace" \
-        -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
-
-    if echo "$CONTAINERS" | grep -q "kube-rbac-proxy"; then
-        if [ "$verbose" = true ]; then
-            echo "  PASS: kube-rbac-proxy sidecar container present (RHOAI 3.x)"
-        fi
-    else
-        if [ "$verbose" = true ]; then
-            echo "  FAIL: kube-rbac-proxy sidecar container missing"
-        fi
-        pass=false
-    fi
-
-    if echo "$CONTAINERS" | grep -q "oauth-proxy"; then
-        if [ "$verbose" = true ]; then
-            echo "  FAIL: Legacy oauth-proxy sidecar still present (RHOAI 2.x)"
-        fi
-        pass=false
-    else
-        if [ "$verbose" = true ]; then
-            echo "  PASS: Legacy oauth-proxy sidecar removed"
         fi
     fi
 
@@ -938,25 +950,46 @@ patch_kueue_label_workbench() {
 list_workbench() {
     local name="$1"
     local namespace="$2"
-    local inject_oauth inject_auth status
+    local inject_oauth inject_auth containers status
+    local has_kube_rbac_proxy=false has_oauth_proxy=false
 
     inject_oauth=$(oc get notebook "$name" -n "$namespace" \
         -o jsonpath='{.metadata.annotations.notebooks\.opendatahub\.io/inject-oauth}' 2>/dev/null)
     inject_auth=$(oc get notebook "$name" -n "$namespace" \
         -o jsonpath='{.metadata.annotations.notebooks\.opendatahub\.io/inject-auth}' 2>/dev/null)
+    containers=$(oc get notebook "$name" -n "$namespace" \
+        -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
+
+    echo "$containers" | grep -q "kube-rbac-proxy" && has_kube_rbac_proxy=true
+    echo "$containers" | grep -q "oauth-proxy" && has_oauth_proxy=true
 
     echo "=== Notebook: $name  (namespace: $namespace) ==="
     echo "  inject-oauth annotation: ${inject_oauth:-<not set>}"
     echo "  inject-auth  annotation: ${inject_auth:-<not set>}"
+    echo "  kube-rbac-proxy sidecar: $has_kube_rbac_proxy"
+    echo "  oauth-proxy sidecar:     $has_oauth_proxy"
 
-    if [ "$inject_oauth" = "true" ] && [ "$inject_auth" = "true" ]; then
-        echo "  Status: INVALID — both inject-oauth and inject-auth are set (likely an incomplete migration)."
-    elif [ "$inject_auth" = "true" ]; then
-        echo "  Status: MIGRATED"
-    elif [ "$inject_oauth" = "true" ]; then
-        echo "  Status: LEGACY — needs migration to 3.x"
+    # Primary: sidecar-based status detection
+    if [ "$has_kube_rbac_proxy" = true ] && [ "$has_oauth_proxy" = true ]; then
+        echo "  Status: INVALID — both kube-rbac-proxy and oauth-proxy sidecars present"
+    elif [ "$has_kube_rbac_proxy" = true ]; then
+        # Migrated - kube-rbac-proxy is present, oauth-proxy is not
+        if [ "$inject_oauth" = "true" ]; then
+            echo "  Status: MIGRATED (leftover inject-oauth annotation)"
+        else
+            echo "  Status: MIGRATED"
+        fi
+    elif [ "$has_oauth_proxy" = true ]; then
+        # oauth-proxy is present - check if unreconciled (inject-auth set but sidecar didn't switch)
+        if [ "$inject_auth" = "true" ]; then
+            echo "  Status: UNRECONCILED — inject-auth is set but oauth-proxy sidecar still present"
+            echo "         Check notebook controller logs for reconciliation errors"
+        else
+            echo "  Status: LEGACY — needs migration to 3.x"
+        fi
     else
-        echo "  Status: UNKNOWN — neither annotation found"
+        # Neither sidecar present
+        echo "  Status: UNKNOWN — no auth sidecars found"
     fi
     echo ""
 }
@@ -964,7 +997,7 @@ list_workbench() {
 # Scan all notebooks on the cluster, classify each by migration status,
 # and print a summary table. Uses a single API call for efficiency.
 list_all_workbenches() {
-    local json total legacy=0 migrated=0 invalid=0 unknown=0
+    local json total legacy=0 migrated=0 invalid=0 unknown=0 unreconciled=0
 
     json=$(oc get notebooks --all-namespaces -o json 2>/dev/null)
     total=$(echo "$json" | jq '.items | length')
@@ -980,18 +1013,36 @@ list_all_workbenches() {
     printf "  %-40s %-30s %s\n" "NAME" "NAMESPACE" "STATUS"
     printf "  %-40s %-30s %s\n" "----" "---------" "------"
 
-    while IFS='|' read -r nb_name nb_namespace oauth auth; do
+    while IFS='|' read -r nb_name nb_namespace oauth auth containers; do
         local status
-        if [ "$oauth" = "true" ] && [ "$auth" = "true" ]; then
+        local has_kube_rbac_proxy=false has_oauth_proxy=false
+
+        echo "$containers" | grep -q "kube-rbac-proxy" && has_kube_rbac_proxy=true
+        echo "$containers" | grep -q "oauth-proxy" && has_oauth_proxy=true
+
+        # Primary: sidecar-based status detection
+        if [ "$has_kube_rbac_proxy" = true ] && [ "$has_oauth_proxy" = true ]; then
             status="INVALID"
             invalid=$((invalid + 1))
-        elif [ "$auth" = "true" ]; then
-            status="MIGRATED (3.x)"
+        elif [ "$has_kube_rbac_proxy" = true ]; then
+            # Migrated - kube-rbac-proxy present, oauth-proxy not
+            if [ "$oauth" = "true" ]; then
+                status="MIGRATED (leftover annotation)"
+            else
+                status="MIGRATED (3.x)"
+            fi
             migrated=$((migrated + 1))
-        elif [ "$oauth" = "true" ]; then
-            status="LEGACY (2.x)"
-            legacy=$((legacy + 1))
+        elif [ "$has_oauth_proxy" = true ]; then
+            # oauth-proxy present - check if unreconciled
+            if [ "$auth" = "true" ]; then
+                status="UNRECONCILED (check logs)"
+                unreconciled=$((unreconciled + 1))
+            else
+                status="LEGACY (2.x)"
+                legacy=$((legacy + 1))
+            fi
         else
+            # Neither sidecar present
             status="UNKNOWN"
             unknown=$((unknown + 1))
         fi
@@ -1000,7 +1051,8 @@ list_all_workbenches() {
         .metadata.name,
         .metadata.namespace,
         (.metadata.annotations["notebooks.opendatahub.io/inject-oauth"] // ""),
-        (.metadata.annotations["notebooks.opendatahub.io/inject-auth"] // "")
+        (.metadata.annotations["notebooks.opendatahub.io/inject-auth"] // ""),
+        ([.spec.template.spec.containers[].name] | join(" "))
     ] | join("|")')
 
     echo ""
@@ -1008,12 +1060,17 @@ list_all_workbenches() {
     echo "  Total notebooks:  $total"
     echo "  Legacy (2.x):     $legacy"
     echo "  Migrated (3.x):   $migrated"
+    echo "  Unreconciled:     $unreconciled"
     echo "  Invalid state:    $invalid"
     echo "  Unknown:          $unknown"
     echo ""
 
     if [ "$legacy" -gt 0 ]; then
         echo "  WARNING: $legacy notebook(s) still need migration (LEGACY)."
+    fi
+    if [ "$unreconciled" -gt 0 ]; then
+        echo "  ERROR:   $unreconciled notebook(s) are UNRECONCILED — inject-auth annotation is set but"
+        echo "           oauth-proxy sidecar is still present. Check notebook controller logs."
     fi
     if [ "$invalid" -gt 0 ]; then
         echo "  ERROR:   $invalid notebook(s) are in an invalid state — review manually."
