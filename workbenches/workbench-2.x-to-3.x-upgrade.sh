@@ -80,16 +80,18 @@ Options:
                            and after patching (use only if you are managing the
                            workbench lifecycle manually)
   --only-stopped           Only patch workbenches that are already stopped
-                           (patch command only; skips running workbenches)
+                           (patch command only; skips running workbenches;
+                           implies --all when no other target is specified)
   --with-cleanup           Run cleanup automatically after a successful patch
                            (patch command only)
   -y, --yes                Skip confirmation prompts (for automation / CI)
   --queue-name NAME        Queue name value for attach-kueue-label (default: 'default')
 
-Target mode (one required):
+Target mode (one required unless --only-stopped is used):
   --name NAME --namespace NAMESPACE   Single notebook
   --namespace NAMESPACE               All notebooks in a namespace
   --all                               All notebooks cluster-wide
+  --only-stopped                      Implies --all (patch command only)
 
 Examples (main workflow):
   $(basename "$0") list    --all
@@ -97,7 +99,8 @@ Examples (main workflow):
   $(basename "$0") patch   --namespace my-ns                 # All notebooks in namespace
   $(basename "$0") patch   --name my-wb --namespace my-ns --with-cleanup
   $(basename "$0") patch   --all --skip-stop
-  $(basename "$0") patch   --all --only-stopped
+  $(basename "$0") patch   --only-stopped                      # Implies --all
+  $(basename "$0") patch   --only-stopped --namespace my-ns    # Only stopped in namespace
   $(basename "$0") cleanup --all
   $(basename "$0") verify  --name my-wb --namespace my-ns
   $(basename "$0") verify  --namespace my-ns                 # All notebooks in namespace
@@ -358,13 +361,8 @@ stop_workbench() {
     local name="$1"
     local namespace="$2"
 
-    # Check if the workbench is already stopped (annotation present)
-    local stopped_annotation
-    stopped_annotation=$(oc get notebook "$name" -n "$namespace" \
-        -o jsonpath='{.metadata.annotations.kubeflow-resource-stopped}' 2>/dev/null)
-
-    if [ -n "$stopped_annotation" ]; then
-        echo "  Workbench '$name' in '$namespace' is already stopped (since $stopped_annotation) — skipping."
+    if is_workbench_stopped "$name" "$namespace"; then
+        echo "  Workbench '$name' in '$namespace' is already stopped — skipping."
         return 0
     fi
 
@@ -1304,6 +1302,12 @@ done
 
 # Validate targeting options and determine mode
 # MODE: "all" | "namespace" | "single"
+
+# If --only-stopped is set without any targeting option, default to --all
+if [ "$ONLY_STOPPED" = true ] && [ "$ALL" = false ] && [ -z "$NAMESPACE" ] && [ -z "$NAME" ]; then
+    ALL=true
+fi
+
 if [ "$ALL" = true ] && { [ -n "$NAME" ] || [ -n "$NAMESPACE" ]; }; then
     echo "Error: --all cannot be combined with --name/--namespace."
     usage
