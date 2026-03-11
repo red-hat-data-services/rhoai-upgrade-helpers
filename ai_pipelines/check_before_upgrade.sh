@@ -14,6 +14,11 @@ done
 DSPA_RESOURCE="datasciencepipelinesapplications.datasciencepipelinesapplications.opendatahub.io"
 STATE_FILE="${DSPA_STATE_FILE:-/tmp/dspa_pre_upgrade_pods.json}"
 
+# Initialize tracking variables (populated in Step 2)
+initial_v1alpha1=""
+custom_roles=""
+overall_rc=0
+
 # Returns a compact JSON object for all pods matching a given prefix in the pre-fetched pod data.
 # Groups by prefix so post-upgrade comparison works even if pod names change (new ReplicaSet suffix).
 get_pod_group() {
@@ -43,10 +48,101 @@ get_pod_group() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 1: Fix deprecated v1alpha1 API versions and flag custom role issues
+# Step 1: Capture pre-upgrade pod health state
 # ─────────────────────────────────────────────────────────────────────────────
 echo '################################################################################'
-echo "> Step 1: Checking for deprecated DSPA API versions and custom roles"
+echo "> Step 1: Pre-Upgrade DSPA Pod Health Check"
+echo "> State will be saved to: ${STATE_FILE}"
+echo '################################################################################'
+
+dspas=$(kubectl get "$DSPA_RESOURCE" -A -o json | jq -c '
+  .items[] |
+  select(.apiVersion == "datasciencepipelinesapplications.opendatahub.io/v1") |
+  {dspa_name: .metadata.name, namespace: .metadata.namespace}')
+
+if [[ -z "$dspas" ]]; then
+    echo "> No v1 DSPAs found. Skipping pod health capture."
+    jq -n --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '{captured_at: $ts, dspas: []}' > "$STATE_FILE"
+    echo "> Pre-upgrade state saved to: ${STATE_FILE}"
+    echo '################################################################################'
+else
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' EXIT
+
+    dspa_index=0
+
+    while IFS= read -r dspa; do
+        dspa_name=$(echo "$dspa" | jq -r '.dspa_name')
+        namespace=$(echo "$dspa" | jq -r '.namespace')
+
+        echo ""
+        echo "> DSPA: ${dspa_name} | Namespace: ${namespace}"
+
+        pod_data=$(kubectl get pods -n "$namespace" -o json)
+        pod_groups_json="[]"
+        dspa_rc=0
+
+        for prefix in "ds-pipeline-${dspa_name}" "mariadb-${dspa_name}"; do
+            echo "  Checking pods with prefix '${prefix}'..."
+
+            group=$(get_pod_group "$pod_data" "$prefix")
+            pod_groups_json=$(echo "$pod_groups_json" | jq --argjson g "$group" '. + [$g]')
+
+            pods_found=$(echo "$group" | jq -r '.pods_found')
+
+            if [[ "$pods_found" == "false" ]]; then
+                echo "    [WARN] No pods found"
+                dspa_rc=1
+            else
+                while IFS= read -r pod; do
+                    pod_name=$(echo "$pod" | jq -r '.name')
+                    phase=$(echo "$pod" | jq -r '.phase')
+                    ready=$(echo "$pod" | jq -r '.ready')
+                    healthy=$(echo "$pod" | jq -r '.healthy')
+
+                    if [[ "$healthy" == "true" ]]; then
+                        echo "    [OK]   ${pod_name} (Running, Ready)"
+                    else
+                        echo "    [FAIL] ${pod_name} (Phase: ${phase}, Ready: ${ready})"
+                        dspa_rc=1
+                    fi
+                done < <(echo "$group" | jq -c '.pods[]')
+            fi
+        done
+
+        [[ $dspa_rc -ne 0 ]] && overall_rc=1
+
+        jq -n \
+            --arg name "$dspa_name" \
+            --arg ns "$namespace" \
+            --argjson groups "$pod_groups_json" \
+            '{dspa_name: $name, namespace: $ns, pod_groups: $groups}' \
+            > "${tmp_dir}/dspa_${dspa_index}.json"
+
+        dspa_index=$((dspa_index + 1))
+    done <<< "$dspas"
+
+    # Combine all per-DSPA files into a single state file
+    jq -s --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '{captured_at: $ts, dspas: .}' \
+        "${tmp_dir}"/dspa_*.json > "$STATE_FILE"
+
+    echo ""
+    echo "> Pre-upgrade state saved to: ${STATE_FILE}"
+    echo '################################################################################'
+    if [[ $overall_rc -eq 0 ]]; then
+        echo "> Pre-upgrade: All DSPA pods are healthy"
+    else
+        echo "> Pre-upgrade: One or more DSPA pods are unhealthy or missing"
+    fi
+    echo '################################################################################'
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2: Fix deprecated v1alpha1 API versions and flag custom role issues
+# ─────────────────────────────────────────────────────────────────────────────
+echo '################################################################################'
+echo "> Step 2: Checking for deprecated DSPA API versions and custom roles"
 echo '################################################################################'
 
 v1alpha1Versions=$(kubectl get "$DSPA_RESOURCE" -A -o json | jq -r '
@@ -115,101 +211,11 @@ if [[ -n "$custom_roles" ]]; then
     done
 fi
 
+echo '################################################################################'
+
 if [[ -z "$initial_v1alpha1" && -z "$custom_roles" ]]; then
-    echo '> No deprecated API versions or custom roles found'
-fi
-
-echo '################################################################################'
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2: Capture pre-upgrade pod health state
-# ─────────────────────────────────────────────────────────────────────────────
-echo '################################################################################'
-echo "> Step 2: Pre-Upgrade DSPA Pod Health Check"
-echo "> State will be saved to: ${STATE_FILE}"
-echo '################################################################################'
-
-dspas=$(kubectl get "$DSPA_RESOURCE" -A -o json | jq -c '
-  .items[] |
-  select(.apiVersion == "datasciencepipelinesapplications.opendatahub.io/v1") |
-  {dspa_name: .metadata.name, namespace: .metadata.namespace}')
-
-if [[ -z "$dspas" ]]; then
-    echo "> No v1 DSPAs found. Skipping pod health capture."
+    echo "> No deprecated API versions or custom roles found. No need to do anything, proceed with your upgrade."
     echo '################################################################################'
-    exit 0
 fi
-
-tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT
-
-overall_rc=0
-dspa_index=0
-
-while IFS= read -r dspa; do
-    dspa_name=$(echo "$dspa" | jq -r '.dspa_name')
-    namespace=$(echo "$dspa" | jq -r '.namespace')
-
-    echo ""
-    echo "> DSPA: ${dspa_name} | Namespace: ${namespace}"
-
-    pod_data=$(kubectl get pods -n "$namespace" -o json)
-    pod_groups_json="[]"
-    dspa_rc=0
-
-    for prefix in "ds-pipeline-${dspa_name}" "mariadb-${dspa_name}"; do
-        echo "  Checking pods with prefix '${prefix}'..."
-
-        group=$(get_pod_group "$pod_data" "$prefix")
-        pod_groups_json=$(echo "$pod_groups_json" | jq --argjson g "$group" '. + [$g]')
-
-        pods_found=$(echo "$group" | jq -r '.pods_found')
-
-        if [[ "$pods_found" == "false" ]]; then
-            echo "    [WARN] No pods found"
-            dspa_rc=1
-        else
-            while IFS= read -r pod; do
-                pod_name=$(echo "$pod" | jq -r '.name')
-                phase=$(echo "$pod" | jq -r '.phase')
-                ready=$(echo "$pod" | jq -r '.ready')
-                healthy=$(echo "$pod" | jq -r '.healthy')
-
-                if [[ "$healthy" == "true" ]]; then
-                    echo "    [OK]   ${pod_name} (Running, Ready)"
-                else
-                    echo "    [FAIL] ${pod_name} (Phase: ${phase}, Ready: ${ready})"
-                    dspa_rc=1
-                fi
-            done < <(echo "$group" | jq -c '.pods[]')
-        fi
-    done
-
-    [[ $dspa_rc -ne 0 ]] && overall_rc=1
-
-    jq -n \
-        --arg name "$dspa_name" \
-        --arg ns "$namespace" \
-        --argjson groups "$pod_groups_json" \
-        '{dspa_name: $name, namespace: $ns, pod_groups: $groups}' \
-        > "${tmp_dir}/dspa_${dspa_index}.json"
-
-    dspa_index=$((dspa_index + 1))
-done <<< "$dspas"
-
-# Combine all per-DSPA files into a single state file
-jq -s --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    '{captured_at: $ts, dspas: .}' \
-    "${tmp_dir}"/dspa_*.json > "$STATE_FILE"
-
-echo ""
-echo "> Pre-upgrade state saved to: ${STATE_FILE}"
-echo '################################################################################'
-if [[ $overall_rc -eq 0 ]]; then
-    echo "> Pre-upgrade: All DSPA pods are healthy"
-else
-    echo "> Pre-upgrade: One or more DSPA pods are unhealthy or missing"
-fi
-echo '################################################################################'
 
 exit $overall_rc
