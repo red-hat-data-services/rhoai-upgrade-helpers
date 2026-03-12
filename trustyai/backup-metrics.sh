@@ -11,7 +11,7 @@ set -euo pipefail
 
 # Configuration
 NAMESPACE="${TRUSTYAI_NAMESPACE:-}"
-BACKUP_DIR="${BACKUP_DIR:-./backups}"
+BACKUP_DIR="${BACKUP_DIR:-/tmp/rhoai-upgrade-backup/trustyai}"
 ROUTE_LABEL="${ROUTE_LABEL:-trustyai-service-name=trustyai-service}"
 
 # Functions
@@ -35,7 +35,7 @@ Backup TrustyAI scheduled metrics to a JSON file.
 
 OPTIONS:
     -n, --namespace NAMESPACE    OpenShift namespace (required)
-    -d, --backup-dir DIR         Backup directory (default: ./backups)
+    -d, --backup-dir DIR         Backup directory (default: /tmp/rhoai-upgrade-backup/trustyai)
     -l, --route-label LABEL      Route label selector (default: trustyai-service-name=trustyai-service)
     -t, --type TYPE              Metric type filter: all, fairness (default: all)
     -h, --help                   Show this help message

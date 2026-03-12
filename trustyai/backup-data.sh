@@ -15,7 +15,7 @@ set -euo pipefail
 
 # Configuration
 NAMESPACE="${TRUSTYAI_NAMESPACE:-}"
-BACKUP_DIR="${BACKUP_DIR:-./backups}"
+BACKUP_DIR="${BACKUP_DIR:-/tmp/rhoai-upgrade-backup/trustyai}"
 TAS_NAME=""
 
 # Functions
