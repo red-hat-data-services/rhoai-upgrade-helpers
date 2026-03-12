@@ -12,7 +12,8 @@ for cmd in kubectl jq; do
 done
 
 DSPA_RESOURCE="datasciencepipelinesapplications.datasciencepipelinesapplications.opendatahub.io"
-STATE_FILE="${DSPA_STATE_FILE:-/tmp/dspa_pre_upgrade_pods.json}"
+RHOAI_UPGRADE_BACKUP_DIR="${RHOAI_UPGRADE_BACKUP_DIR:-/tmp/rhoai-upgrade-backup}"
+STATE_FILE="${RHOAI_UPGRADE_BACKUP_DIR}/ai_pipelines/dspa_pre_upgrade_pods.json"
 WAIT_TIMEOUT="${DSPA_WAIT_TIMEOUT:-120}"
 POLL_INTERVAL=15
 
