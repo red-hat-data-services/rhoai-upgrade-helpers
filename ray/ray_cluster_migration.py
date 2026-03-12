@@ -1086,7 +1086,8 @@ def _set_dsc_codeflare_removed(api_client) -> Tuple[bool, str]:
 
 # Label that indicates a RayCluster is managed by Kueue (queue-based scheduling)
 KUEUE_QUEUE_NAME_LABEL = "kueue.x-k8s.io/queue-name"
-# Cluster-scoped Kueue CR name (RHBoK default)
+# Namespace label that indicates the namespace is Kueue-managed
+KUEUE_MANAGED_NS_LABEL = "kueue.openshift.io/managed"
 # Message shown when Kueue pre-req check fails (DSC kueue still Managed)
 KUEUE_MIGRATION_INCOMPLETE_MSG = (
     "Kueue is detected as Managed in the DSC. "
@@ -1098,6 +1099,87 @@ def _get_dsc_kueue_management_state(dsc: dict) -> str:
     """Get spec.components.kueue.managementState from a DSC item."""
     state = (dsc.get("spec", {}).get("components") or {}).get("kueue") or {}
     return (state.get("managementState") or "").strip()
+
+
+def _dsc_has_kueue_component(dsc: dict) -> bool:
+    """Return True if DSC spec.components.kueue is present (managed or unmanaged)."""
+    components = dsc.get("spec", {}).get("components") or {}
+    return "kueue" in components
+
+
+def _is_rhbok_installed(api_client) -> bool:
+    """Return True if RHBoK (Kueue) is installed on the cluster (Kueue CRD/API exists)."""
+    try:
+        custom_api = client.CustomObjectsApi(api_client)
+        custom_api.list_cluster_custom_object(
+            group="kueue.x-k8s.io",
+            version="v1beta1",
+            plural="clusterqueues",
+        )
+        return True
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        # 403 or other: API exists but we may lack permission — treat as installed
+        return True
+    except Exception:
+        return False
+
+
+def _is_kueue_environment(api_client, dsc: Optional[dict]) -> bool:
+    """
+    Return True if the cluster is in a Kueue-managed environment: either DSC has
+    the kueue component (managed or unmanaged) or RHBoK (Kueue) is installed.
+    """
+    if dsc and _dsc_has_kueue_component(dsc):
+        return True
+    return _is_rhbok_installed(api_client)
+
+
+def _get_kueue_managed_namespaces(api_client) -> Dict[str, bool]:
+    """Return a dict of namespace names that carry the kueue.openshift.io/managed label."""
+    try:
+        core_api = client.CoreV1Api(api_client)
+        ns_list = core_api.list_namespace(
+            label_selector=KUEUE_MANAGED_NS_LABEL
+        )
+        return {ns.metadata.name: True for ns in ns_list.items}
+    except Exception:
+        return {}
+
+
+def _check_kueue_namespace_consistency(
+    items: list, managed_namespaces: Dict[str, bool]
+) -> List[str]:
+    """
+    Validate two-way consistency between namespace labels and RayCluster labels:
+      1. Every RayCluster in a kueue-managed namespace must have the queue-name label.
+      2. Every RayCluster with the queue-name label must be in a kueue-managed namespace.
+
+    Returns a list of human-readable error strings (empty if all consistent).
+    """
+    errors = []
+
+    for rc in items:
+        name = rc.get("metadata", {}).get("name", "?")
+        ns = rc.get("metadata", {}).get("namespace", "?")
+        has_queue_label = bool(
+            (rc.get("metadata", {}).get("labels") or {}).get(KUEUE_QUEUE_NAME_LABEL)
+        )
+        ns_is_managed = ns in managed_namespaces
+
+        if ns_is_managed and not has_queue_label:
+            errors.append(
+                f"{name}/{ns}: namespace '{ns}' has {KUEUE_MANAGED_NS_LABEL} label "
+                f"but RayCluster is missing {KUEUE_QUEUE_NAME_LABEL} label"
+            )
+        elif has_queue_label and not ns_is_managed:
+            errors.append(
+                f"{name}/{ns}: RayCluster has {KUEUE_QUEUE_NAME_LABEL} label "
+                f"but namespace '{ns}' is missing {KUEUE_MANAGED_NS_LABEL} label"
+            )
+
+    return errors
 
 
 def _check_rayclusters_present(api_client) -> Tuple[bool, str]:
@@ -1137,9 +1219,13 @@ def _check_rayclusters_present(api_client) -> Tuple[bool, str]:
 
 def _check_kueue_rhbok_if_used(api_client) -> Tuple[bool, str]:
     """
-    If the user has Kueue-managed RayClusters, check that they have started the
-    Kueue pre-upgrade. We only check DSC: if kueue managementState is "Managed",
-    the user has not yet started the Kueue pre-upgrade.
+    Validates Kueue/RayCluster consistency for migration eligibility:
+      1. Every RayCluster in a namespace labelled kueue.openshift.io/managed must
+         have the kueue.x-k8s.io/queue-name label.
+      2. Every RayCluster with kueue.x-k8s.io/queue-name must be in a namespace
+         labelled kueue.openshift.io/managed.
+      3. If Kueue-labelled RayClusters exist, the DSC kueue managementState must
+         not still be "Managed" (i.e. Kueue pre-upgrade must have started).
 
     Returns:
         Tuple[bool, str]: (check_passed, message)
@@ -1147,36 +1233,7 @@ def _check_kueue_rhbok_if_used(api_client) -> Tuple[bool, str]:
     try:
         custom_api = client.CustomObjectsApi(api_client)
 
-        # List all RayClusters cluster-wide
-        try:
-            result = custom_api.list_cluster_custom_object(
-                group="ray.io",
-                version="v1",
-                plural="rayclusters",
-            )
-        except ApiException as e:
-            if e.status == 404:
-                return True, "Kueue not in use (no RayClusters on cluster); Kueue pre-req not required."
-            return True, f"Could not list RayClusters (skipping Kueue check): {e.reason}"
-
-        items = result.get("items", [])
-        kueue_managed = [
-            rc
-            for rc in items
-            if (rc.get("metadata", {}).get("labels") or {}).get(KUEUE_QUEUE_NAME_LABEL)
-        ]
-
-        if not kueue_managed:
-            total = len(items)
-            return (
-                True,
-                f"Kueue not in use (none of {total} RayCluster(s) have {KUEUE_QUEUE_NAME_LABEL}); "
-                "Kueue pre-req not required.",
-            )
-
-        count = len(kueue_managed)
-
-        # Only check: DSC kueue managementState must not be "Managed" (that means pre-upgrade not started)
+        # Fetch DSC once for kueue-environment detection and Managed check
         dsc = None
         try:
             dscs = custom_api.list_cluster_custom_object(
@@ -1192,11 +1249,68 @@ def _check_kueue_rhbok_if_used(api_client) -> Tuple[bool, str]:
             else:
                 return True, f"Could not check DataScienceCluster (skipping Kueue check): {e.reason}"
 
-        if dsc:
+        # List all RayClusters cluster-wide
+        try:
+            result = custom_api.list_cluster_custom_object(
+                group="ray.io",
+                version="v1",
+                plural="rayclusters",
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return True, "Kueue not in use (no RayClusters on cluster); Kueue pre-req not required."
+            return True, f"Could not list RayClusters (skipping Kueue check): {e.reason}"
+
+        items = result.get("items", [])
+        if not items:
+            return (
+                True,
+                "No RayClusters on cluster; Kueue pre-req not required.",
+            )
+
+        # Determine if we're in a Kueue environment (DSC kueue managed/unmanaged or RHBoK installed)
+        in_kueue_env = _is_kueue_environment(api_client, dsc)
+
+        # Fetch namespaces with the kueue.openshift.io/managed label
+        managed_namespaces = _get_kueue_managed_namespaces(api_client)
+
+        # Two-way namespace/label consistency check
+        consistency_errors = _check_kueue_namespace_consistency(items, managed_namespaces)
+        if consistency_errors:
+            details = "\n       ".join(consistency_errors)
+            return (
+                False,
+                f"Kueue label/namespace mismatch — the following RayCluster(s) are not eligible for migration:\n"
+                f"       {details}",
+            )
+
+        # Count RayClusters that have the label (for messaging)
+        kueue_managed = [
+            rc
+            for rc in items
+            if (rc.get("metadata", {}).get("labels") or {}).get(KUEUE_QUEUE_NAME_LABEL)
+        ]
+        count = len(kueue_managed)
+
+        # If any RayClusters have the label, require DSC kueue not still "Managed" (pre-upgrade started)
+        if kueue_managed and dsc:
             kueue_state = _get_dsc_kueue_management_state(dsc)
             if (kueue_state or "").lower() == "managed":
                 return (False, KUEUE_MIGRATION_INCOMPLETE_MSG)
 
+        if in_kueue_env or managed_namespaces:
+            return (
+                True,
+                f"Kueue environment: all {len(items)} RayCluster(s) have consistent "
+                f"Kueue labels; eligible for migration."
+                + (" DSC kueue not Managed (pre-upgrade started or N/A)." if count else ""),
+            )
+        if not kueue_managed:
+            return (
+                True,
+                f"Kueue not in use (none of {len(items)} RayCluster(s) have {KUEUE_QUEUE_NAME_LABEL}); "
+                "Kueue pre-req not required.",
+            )
         return (
             True,
             f"Kueue in use: {count} Kueue-managed RayCluster(s); DSC kueue not Managed (pre-upgrade started or N/A).",
@@ -2185,8 +2299,9 @@ def list_ray_clusters(
     except Exception as e:
         raise RuntimeError(f"Failed to connect to Kubernetes cluster: {e}")
 
-    api_instance = client.CustomObjectsApi(get_api_client())
-    core_api = client.CoreV1Api(get_api_client())
+    api_client = get_api_client()
+    api_instance = client.CustomObjectsApi(api_client)
+    core_api = client.CoreV1Api(api_client)
 
     # Describe scope
     scope_msg = f"namespace '{namespace}'" if namespace else "all namespaces"
@@ -2197,6 +2312,28 @@ def list_ray_clusters(
     if not clusters:
         print("No RayClusters found")
         return []
+
+    # Determine if we're in a Kueue environment (for migration eligibility)
+    dsc = None
+    try:
+        dscs = api_instance.list_cluster_custom_object(
+            group="datasciencecluster.opendatahub.io",
+            version="v1",
+            plural="datascienceclusters",
+        )
+        if dscs.get("items"):
+            dsc = dscs["items"][0]
+    except Exception:
+        pass
+    in_kueue_env = _is_kueue_environment(api_client, dsc)
+    managed_namespaces = _get_kueue_managed_namespaces(api_client)
+
+    # Build a set of RayClusters that fail namespace/label consistency
+    consistency_errors = _check_kueue_namespace_consistency(clusters, managed_namespaces)
+    inconsistent_keys = set()
+    for err in consistency_errors:
+        key = err.split(":")[0]
+        inconsistent_keys.add(key)
 
     print(f"Found {len(clusters)} RayCluster(s)")
     print("Analyzing clusters...")
@@ -2214,6 +2351,28 @@ def list_ray_clusters(
         # Check migration status
         is_migrated, migration_reason = _is_cluster_migrated(rc)
         has_tls_oauth, components = _has_tls_oauth_components(rc)
+
+        # Check Kueue namespace/label consistency for migration eligibility
+        not_eligible_kueue = False
+        rc_key = f"{name}/{ns}"
+        has_queue_label = bool(
+            (rc.get("metadata", {}).get("labels") or {}).get(KUEUE_QUEUE_NAME_LABEL)
+        )
+        ns_is_managed = ns in managed_namespaces
+
+        if rc_key in inconsistent_keys:
+            not_eligible_kueue = True
+            is_migrated = False
+            if ns_is_managed and not has_queue_label:
+                migration_reason = f"Not eligible (in managed namespace '{ns}' but missing {KUEUE_QUEUE_NAME_LABEL} label)"
+            elif has_queue_label and not ns_is_managed:
+                migration_reason = f"Not eligible (has {KUEUE_QUEUE_NAME_LABEL} label but namespace '{ns}' missing {KUEUE_MANAGED_NS_LABEL} label)"
+            else:
+                migration_reason = "Not eligible (Kueue label/namespace mismatch)"
+        elif in_kueue_env and not has_queue_label:
+            not_eligible_kueue = True
+            is_migrated = False
+            migration_reason = "Not eligible (missing Kueue label)"
 
         # Extract resource information
         head_resources = {}
@@ -2262,6 +2421,7 @@ def list_ray_clusters(
             "num_workers": num_workers,
             "migrated": is_migrated,
             "migration_status": migration_reason,
+            "not_eligible_kueue": not_eligible_kueue,
             "tls_oauth_components": components if has_tls_oauth else [],
             "head_resources": head_resources,
             "worker_resources": worker_resources,
@@ -2284,12 +2444,17 @@ def list_ray_clusters(
 
         migrated_count = 0
         needs_migration_count = 0
+        not_eligible_count = 0
 
         for cluster in clusters_info:
-            migration_indicator = "[OK]" if cluster["migrated"] else "[NEEDS MIGRATION]"
-            if cluster["migrated"]:
+            if cluster.get("not_eligible_kueue"):
+                migration_indicator = "[NOT ELIGIBLE]"
+                not_eligible_count += 1
+            elif cluster["migrated"]:
+                migration_indicator = "[OK]"
                 migrated_count += 1
             else:
+                migration_indicator = "[NEEDS MIGRATION]"
                 needs_migration_count += 1
 
             print(
@@ -2300,9 +2465,12 @@ def list_ray_clusters(
                 f"{migration_indicator}"
             )
 
-        print(
-            f"\nMigration Summary: {migrated_count} migrated, {needs_migration_count} need migration"
-        )
+        summary_parts = [f"{migrated_count} migrated", f"{needs_migration_count} need migration"]
+        if not_eligible_count:
+            summary_parts.append(
+                f"{not_eligible_count} not eligible (missing Kueue label)"
+            )
+        print(f"\nMigration Summary: {', '.join(summary_parts)}")
 
     return clusters_info
 
