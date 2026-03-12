@@ -31,11 +31,8 @@ REQUIREMENTS:
 
 USAGE EXAMPLES:
 
-    # Step 1: Backup - All clusters (you'll be prompted for backup directory)
+    # Step 1: Backup - All clusters
     python ray_cluster_migration.py pre-upgrade
-
-    # Step 1: Backup - With specific directory
-    python ray_cluster_migration.py pre-upgrade ./my-backup-dir
 
     # Step 1: Backup - Specific namespace
     python ray_cluster_migration.py pre-upgrade --namespace my-ns
@@ -43,7 +40,9 @@ USAGE EXAMPLES:
     # Step 1: Backup - Single cluster
     python ray_cluster_migration.py pre-upgrade --cluster my-cluster --namespace my-ns
 
-    # ... Perform RHOAI upgrade ...
+    Backups are saved to $RHOAI_UPGRADE_BACKUP_DIR/ray/ (default: /tmp/rhoai-upgrade-backup/ray/)
+
+     # ... Perform RHOAI upgrade ...
 
     # Step 2: Migrate - Start with the same single cluster
     python ray_cluster_migration.py post-upgrade --cluster my-cluster --namespace my-ns --dry-run
@@ -83,6 +82,8 @@ from typing import List, Dict, Optional, Tuple
 from kubernetes import client, config
 from kubernetes.dynamic import DynamicClient
 from kubernetes.client.rest import ApiException
+
+RHOAI_UPGRADE_BACKUP_DIR = os.environ.get("RHOAI_UPGRADE_BACKUP_DIR", "/tmp/rhoai-upgrade-backup")
 
 # Field manager identifier for server-side apply
 CF_SDK_FIELD_MANAGER = "codeflare-sdk"
@@ -1643,7 +1644,6 @@ def _post_upgrade_from_backup(
 
 
 def pre_upgrade(
-    output_dir: Optional[str] = None,
     cluster_name: Optional[str] = None,
     namespace: Optional[str] = None,
 ) -> List[str]:
@@ -1656,11 +1656,13 @@ def pre_upgrade(
 
     It does NOT delete any clusters - it only creates backup files.
 
+    Backup files are saved to $RHOAI_UPGRADE_BACKUP_DIR/ray/ (default: /tmp/rhoai-upgrade-backup/ray/)
+    with subdirectories for rhoai-2.x and rhoai-3.x compatible configurations.
+
     This operation is idempotent - running it multiple times will simply
     overwrite the backup files.
 
     Args:
-        output_dir: Directory to save backup YAML files (prompts if not provided)
         cluster_name: Specific cluster to backup (requires namespace)
         namespace: Specific namespace to backup (optional)
 
@@ -1670,11 +1672,8 @@ def pre_upgrade(
     print("Starting Ray cluster pre-upgrade...")
     print()
 
-    # Prompt for output directory if not provided
-    if not output_dir:
-        default_dir = "./raycluster-backups"
-        user_input = input(f"Enter backup directory [{default_dir}]: ").strip()
-        output_dir = user_input if user_input else default_dir
+    output_dir = os.path.join(RHOAI_UPGRADE_BACKUP_DIR, "ray")
+    print(f"Backup files will be saved to: {output_dir}")
     print()
 
     print("Connecting to Kubernetes cluster...")
@@ -2560,11 +2559,8 @@ RECOMMENDED MIGRATION WORKFLOW:
 
   1. BEFORE UPGRADE - Backup your clusters:
 
-     # Backup all clusters (you'll be prompted for backup directory)
+     # Backup all clusters
      %(prog)s pre-upgrade
-
-     # Or specify the backup directory directly
-     %(prog)s pre-upgrade ./my-backup-dir
 
      # Backup a specific namespace
      %(prog)s pre-upgrade --namespace my-ns
@@ -2572,7 +2568,9 @@ RECOMMENDED MIGRATION WORKFLOW:
      # Backup a single cluster
      %(prog)s pre-upgrade --cluster my-cluster --namespace my-ns
 
-  2. PERFORM THE RHOAI UPGRADE
+     Backups are saved to $RHOAI_UPGRADE_BACKUP_DIR/ray/ (default: /tmp/rhoai-upgrade-backup/ray/)
+
+   2. PERFORM THE RHOAI UPGRADE
 
   3. AFTER UPGRADE - Migrate your clusters:
 
@@ -2603,13 +2601,8 @@ All operations are idempotent and safe to run multiple times.
         "pre-upgrade",
         help="Backup RayCluster configurations BEFORE the RHOAI upgrade",
         description="Runs pre-flight checks and creates backup YAML files of your "
-        "RayCluster configurations. Run this BEFORE performing the RHOAI upgrade.",
-    )
-    pre_parser.add_argument(
-        "output_dir",
-        nargs="?",
-        default=None,
-        help="Directory to save backup YAML files (you'll be prompted if not provided)",
+        "RayCluster configurations. Run this BEFORE performing the RHOAI upgrade. "
+        "Backups are saved to $RHOAI_UPGRADE_BACKUP_DIR/ray/ (default: /tmp/rhoai-upgrade-backup/ray/).",
     )
     pre_parser.add_argument(
         "--cluster",
@@ -2744,7 +2737,6 @@ All operations are idempotent and safe to run multiple times.
     try:
         if args.command == "pre-upgrade":
             pre_upgrade(
-                output_dir=args.output_dir,
                 cluster_name=args.cluster_name,
                 namespace=args.namespace,
             )

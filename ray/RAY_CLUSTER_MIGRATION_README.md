@@ -58,11 +58,8 @@ The recommended migration workflow follows three stages:
 Backup your RayCluster configurations. This only creates backup files - it does NOT modify or delete any clusters.
 
 ```bash
-# Backup all clusters (you'll be prompted for backup directory)
+# Backup all clusters
 python ray_cluster_migration.py pre-upgrade
-
-# Or specify the backup directory directly
-python ray_cluster_migration.py pre-upgrade ./my-backup-dir
 
 # Backup a specific namespace
 python ray_cluster_migration.py pre-upgrade --namespace my-ns
@@ -71,12 +68,28 @@ python ray_cluster_migration.py pre-upgrade --namespace my-ns
 python ray_cluster_migration.py pre-upgrade --cluster my-cluster --namespace my-ns
 ```
 
+Backups are automatically saved to `$RHOAI_UPGRADE_BACKUP_DIR/ray/` (default: `/tmp/rhoai-upgrade-backup/ray/`).
+
+The backup base directory is controlled by the `RHOAI_UPGRADE_BACKUP_DIR` environment variable, which defaults to `/tmp/rhoai-upgrade-backup`. This allows other migration components to share the same base directory.
+
+**Container usage:** When running inside a Podman container, mount the backup directory to your host to persist the files:
+
+```bash
+podman run -it --rm \
+  -v ~/.kube:/root/.kube:ro \
+  -v /tmp/rhoai-upgrade-backup:/tmp/rhoai-upgrade-backup \
+  -e KUBECONFIG=/root/.kube/config \
+  --entrypoint bash \
+  -w /opt/rhai-upgrade-helpers/ray \
+  quay.io/rhoai/odh-cli-rhel9:rhoai-3.3
+```
+
 #### Backup Directory Structure
 
-The pre-upgrade command creates two subdirectories in your backup location:
+The pre-upgrade command creates two subdirectories in the backup location:
 
 ```
-my-backup-dir/
+/tmp/rhoai-upgrade-backup/ray/
   rhoai-2.x/   # RHOAI 2.x compatible (with CodeFlare components)
   rhoai-3.x/   # RHOAI 3.x compatible (ready for post-upgrade)
 ```
@@ -146,11 +159,8 @@ Migration Summary: 1 migrated, 2 need migration
 Runs pre-flight checks and creates backup YAML files of your RayCluster configurations. Run this BEFORE performing the RHOAI upgrade.
 
 ```bash
-# Backup all clusters (you'll be prompted for backup directory)
+# Backup all clusters
 python ray_cluster_migration.py pre-upgrade
-
-# Or specify the backup directory directly
-python ray_cluster_migration.py pre-upgrade ./my-backup-dir
 
 # Backup all clusters in a namespace
 python ray_cluster_migration.py pre-upgrade --namespace my-ns
@@ -159,9 +169,11 @@ python ray_cluster_migration.py pre-upgrade --namespace my-ns
 python ray_cluster_migration.py pre-upgrade --cluster my-cluster --namespace my-ns
 ```
 
+Backups are automatically saved to `$RHOAI_UPGRADE_BACKUP_DIR/ray/` (default: `/tmp/rhoai-upgrade-backup/ray/`).
+
 **What it does:**
 - Runs pre-flight checks to verify the cluster is ready for upgrade
-- Creates a backup directory if it doesn't exist
+- Creates the backup directory if it doesn't exist
 - Exports each RayCluster to a separate YAML file
 - Does NOT delete or modify any clusters
 
@@ -222,16 +234,16 @@ Use this mode if your clusters were deleted during the upgrade or you prefer a c
 
 ```bash
 # Restore all clusters from the rhoai-3.x/ backup directory
-python ray_cluster_migration.py post-upgrade --from-backup ./my-backup-dir/rhoai-3.x
+python ray_cluster_migration.py post-upgrade --from-backup /tmp/rhoai-upgrade-backup/ray/rhoai-3.x
 
 # Restore clusters in a specific namespace
-python ray_cluster_migration.py post-upgrade --from-backup ./my-backup-dir/rhoai-3.x --namespace my-ns
+python ray_cluster_migration.py post-upgrade --from-backup /tmp/rhoai-upgrade-backup/ray/rhoai-3.x --namespace my-ns
 
 # Restore a single cluster
-python ray_cluster_migration.py post-upgrade --from-backup ./my-backup-dir/rhoai-3.x --cluster my-cluster --namespace my-ns
+python ray_cluster_migration.py post-upgrade --from-backup /tmp/rhoai-upgrade-backup/ray/rhoai-3.x --cluster my-cluster --namespace my-ns
 
 # Restore from a single backup file
-python ray_cluster_migration.py post-upgrade --from-backup ./my-backup-dir/rhoai-3.x/raycluster-my-cluster-my-ns.yaml
+python ray_cluster_migration.py post-upgrade --from-backup /tmp/rhoai-upgrade-backup/ray/rhoai-3.x/raycluster-my-cluster-my-ns.yaml
 ```
 
 **Note**: Use the `rhoai-3.x/` subdirectory for 3.x migration. The `rhoai-2.x/` subdirectory contains 2.x-compatible backups for rollback scenarios.
@@ -399,8 +411,8 @@ The script automatically detects if a cluster has already been migrated and skip
 # 1. Check current state
 python ray_cluster_migration.py list
 
-# 2. Backup everything before upgrade
-python ray_cluster_migration.py pre-upgrade ./backup-$(date +%Y%m%d)
+# 2. Backup everything before upgrade (saved to $RHOAI_UPGRADE_BACKUP_DIR/ray/)
+python ray_cluster_migration.py pre-upgrade
 
 # 3. [Perform RHOAI upgrade using your standard procedure]
 
@@ -473,10 +485,15 @@ Try with verbose output and investigate any error messages.
 Backup files are saved as `raycluster-{name}-{namespace}.yaml`:
 
 ```
-backup/
-├── raycluster-production-cluster-production.yaml
-├── raycluster-staging-cluster-staging.yaml
-└── raycluster-dev-cluster-dev.yaml
+/tmp/rhoai-upgrade-backup/ray/
+├── rhoai-2.x/
+│   ├── raycluster-production-cluster-production.yaml
+│   ├── raycluster-staging-cluster-staging.yaml
+│   └── raycluster-dev-cluster-dev.yaml
+└── rhoai-3.x/
+    ├── raycluster-production-cluster-production.yaml
+    ├── raycluster-staging-cluster-staging.yaml
+    └── raycluster-dev-cluster-dev.yaml
 ```
 
 Each file contains the RayCluster configuration ready for restoration if needed.
