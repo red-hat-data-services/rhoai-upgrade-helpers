@@ -5,7 +5,7 @@
 
 set -e
 
-BACKUP_DIR="${BACKUP_DIR:-./llamastack-backups-$(date +%Y%m%d-%H%M%S)}"
+BACKUP_DIR="${BACKUP_DIR:-/tmp/rhoai-upgrade-backup/llamastack-backups-$(date +%Y%m%d-%H%M%S)}"
 
 # Track LLSDs with custom configs for warning at the end (using temp file due to subshell)
 CUSTOM_CONFIG_FILE=$(mktemp)
