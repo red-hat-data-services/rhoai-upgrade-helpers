@@ -12,7 +12,9 @@ for cmd in kubectl jq; do
 done
 
 DSPA_RESOURCE="datasciencepipelinesapplications.datasciencepipelinesapplications.opendatahub.io"
-STATE_FILE="${DSPA_STATE_FILE:-/tmp/dspa_pre_upgrade_pods.json}"
+RHOAI_UPGRADE_BACKUP_DIR="${RHOAI_UPGRADE_BACKUP_DIR:-/tmp/rhoai-upgrade-backup}"
+STATE_FILE="${RHOAI_UPGRADE_BACKUP_DIR}/ai_pipelines/dspa_pre_upgrade_pods.json"
+mkdir -p "${RHOAI_UPGRADE_BACKUP_DIR}/ai_pipelines"
 
 # Initialize tracking variables (populated in Step 2)
 initial_v1alpha1=""
