@@ -3,10 +3,14 @@
 # Script version and metadata
 SCRIPT_NAME="$(basename "$0")"
 
+# Backup directory (shared across all upgrade helpers)
+RHOAI_UPGRADE_BACKUP_DIR="${RHOAI_UPGRADE_BACKUP_DIR:-/tmp/rhoai-upgrade-backup}"
+SERVERLESS_BACKUP_DIR="${RHOAI_UPGRADE_BACKUP_DIR}/model-serving/serverless-to-raw"
+
 # Default values
 NAMESPACE=""
 SELECTED_ISVCS=()
-PRESERVE_FILES="" 
+PRESERVE_FILES=""
 DRY_RUN="false"
 DELETE_EXISTING="false"
 USE_ORIGINAL_NAMES="false"
@@ -879,11 +883,12 @@ convert_isvc(){
     NAME="$1"
 
     # Create resource directories - use temp directory if not preserving files
+    mkdir -p "$SERVERLESS_BACKUP_DIR"
     if [ "$PRESERVE_FILES" == "true" ]; then
-        RESOURCE_DIR="$NAME"
+        RESOURCE_DIR="${SERVERLESS_BACKUP_DIR}/$NAME"
     else
         # Use a unique temporary directory to avoid conflicts with preserved files
-        RESOURCE_DIR=".tmp-${NAME}-$$"
+        RESOURCE_DIR="${SERVERLESS_BACKUP_DIR}/.tmp-${NAME}-$$"
     fi
     
     ORIGINAL_DIR="$RESOURCE_DIR/original"
@@ -1532,7 +1537,7 @@ main() {
     # Set up global cleanup for temporary directories
     cleanup_temp_dirs() {
         # Clean up any .tmp-* directories that weren't preserved
-        local temp_dirs=$(find . -maxdepth 1 -type d -name ".tmp-*" 2>/dev/null)
+        local temp_dirs=$(find "$SERVERLESS_BACKUP_DIR" -maxdepth 1 -type d -name ".tmp-*" 2>/dev/null)
         if [ -n "$temp_dirs" ]; then
             log_step "Cleaning up temporary directories..."
             echo "$temp_dirs" | while read -r dir; do

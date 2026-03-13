@@ -14,6 +14,9 @@ NC='\033[0m' # No Color
 SUCCESS_SYMBOL="${GREEN}✓${NC}"
 ERROR_SYMBOL="${RED}✗${NC}"
 
+# Backup directory (shared across all upgrade helpers)
+RHOAI_UPGRADE_BACKUP_DIR="${RHOAI_UPGRADE_BACKUP_DIR:-/tmp/rhoai-upgrade-backup}"
+
 # Global variables
 ERRORS=()
 ORIGINAL_ISVCS=()
@@ -277,10 +280,10 @@ initialize_backup_directory() {
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        BACKUP_DIR="migration-dry-run-$(date +%Y%m%d-%H%M%S)"
+        BACKUP_DIR="${RHOAI_UPGRADE_BACKUP_DIR}/model-serving/modelmesh-to-raw/migration-dry-run-$(date +%Y%m%d-%H%M%S)"
         echo "📁 Initializing dry-run directory: $BACKUP_DIR"
     elif [[ "$PRESERVE_NAMESPACE" == "true" ]]; then
-        BACKUP_DIR="preserve-namespace-backup-$(date +%Y%m%d-%H%M%S)"
+        BACKUP_DIR="${RHOAI_UPGRADE_BACKUP_DIR}/model-serving/modelmesh-to-raw/preserve-namespace-backup-$(date +%Y%m%d-%H%M%S)"
         echo "📁 Initializing preserve-namespace backup directory: $BACKUP_DIR"
     fi
 
