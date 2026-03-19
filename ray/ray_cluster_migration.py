@@ -1084,22 +1084,6 @@ def _set_dsc_codeflare_removed(api_client) -> Tuple[bool, str]:
         return False, f"Failed to set codeflare to Removed: {str(e)}"
 
 
-# Label that indicates a RayCluster is managed by Kueue (queue-based scheduling)
-KUEUE_QUEUE_NAME_LABEL = "kueue.x-k8s.io/queue-name"
-# Cluster-scoped Kueue CR name (RHBoK default)
-# Message shown when Kueue pre-req check fails (DSC kueue still Managed)
-KUEUE_MIGRATION_INCOMPLETE_MSG = (
-    "Kueue is detected as Managed in the DSC. "
-    "Please complete the Kueue pre-upgrade before the Ray pre-upgrade."
-)
-
-
-def _get_dsc_kueue_management_state(dsc: dict) -> str:
-    """Get spec.components.kueue.managementState from a DSC item."""
-    state = (dsc.get("spec", {}).get("components") or {}).get("kueue") or {}
-    return (state.get("managementState") or "").strip()
-
-
 def _check_rayclusters_present(api_client) -> Tuple[bool, str]:
     """
     Report how many RayClusters exist on the cluster (cluster-wide).
@@ -1133,77 +1117,6 @@ def _check_rayclusters_present(api_client) -> Tuple[bool, str]:
         return True, f"Could not list RayClusters (skipping): {e.reason}"
     except Exception as e:
         return True, f"Could not list RayClusters (skipping): {str(e)}"
-
-
-def _check_kueue_rhbok_if_used(api_client) -> Tuple[bool, str]:
-    """
-    If the user has Kueue-managed RayClusters, check that they have started the
-    Kueue pre-upgrade. We only check DSC: if kueue managementState is "Managed",
-    the user has not yet started the Kueue pre-upgrade.
-
-    Returns:
-        Tuple[bool, str]: (check_passed, message)
-    """
-    try:
-        custom_api = client.CustomObjectsApi(api_client)
-
-        # List all RayClusters cluster-wide
-        try:
-            result = custom_api.list_cluster_custom_object(
-                group="ray.io",
-                version="v1",
-                plural="rayclusters",
-            )
-        except ApiException as e:
-            if e.status == 404:
-                return True, "Kueue not in use (no RayClusters on cluster); Kueue pre-req not required."
-            return True, f"Could not list RayClusters (skipping Kueue check): {e.reason}"
-
-        items = result.get("items", [])
-        kueue_managed = [
-            rc
-            for rc in items
-            if (rc.get("metadata", {}).get("labels") or {}).get(KUEUE_QUEUE_NAME_LABEL)
-        ]
-
-        if not kueue_managed:
-            total = len(items)
-            return (
-                True,
-                f"Kueue not in use (none of {total} RayCluster(s) have {KUEUE_QUEUE_NAME_LABEL}); "
-                "Kueue pre-req not required.",
-            )
-
-        count = len(kueue_managed)
-
-        # Only check: DSC kueue managementState must not be "Managed" (that means pre-upgrade not started)
-        dsc = None
-        try:
-            dscs = custom_api.list_cluster_custom_object(
-                group="datasciencecluster.opendatahub.io",
-                version="v1",
-                plural="datascienceclusters",
-            )
-            if dscs.get("items"):
-                dsc = dscs["items"][0]
-        except ApiException as e:
-            if e.status == 404:
-                pass
-            else:
-                return True, f"Could not check DataScienceCluster (skipping Kueue check): {e.reason}"
-
-        if dsc:
-            kueue_state = _get_dsc_kueue_management_state(dsc)
-            if (kueue_state or "").lower() == "managed":
-                return (False, KUEUE_MIGRATION_INCOMPLETE_MSG)
-
-        return (
-            True,
-            f"Kueue in use: {count} Kueue-managed RayCluster(s); DSC kueue not Managed (pre-upgrade started or N/A).",
-        )
-
-    except Exception as e:
-        return True, f"Could not run Kueue pre-req check (skipping): {str(e)}"
 
 
 def _check_permission(
@@ -1310,18 +1223,6 @@ def _run_pre_upgrade_checks(api_client) -> List[Dict[str, any]]:
             "required": True,
             "help": "cert-manager is required for RHOAI 3.x. "
             "Install it via OperatorHub before proceeding with the upgrade.",
-        }
-    )
-
-    # If user has Kueue-managed RayClusters, require Kueue pre-RHOAI upgrade (RHBoK) first
-    kueue_ok, kueue_msg = _check_kueue_rhbok_if_used(api_client)
-    checks.append(
-        {
-            "name": "Kueue",
-            "passed": kueue_ok,
-            "message": kueue_msg,
-            "required": True,
-            "help": "",
         }
     )
 
@@ -1682,17 +1583,7 @@ def pre_upgrade(
     api_instance = client.CustomObjectsApi(api_client)
     core_api = client.CoreV1Api(api_client)
 
-    # Set codeflare to Removed in DataScienceCluster first (required pre-upgrade step, must run no matter what)
-    print("Pre-upgrade step: Setting codeflare to Removed in DataScienceCluster...")
-    codeflare_ok, codeflare_msg = _set_dsc_codeflare_removed(api_client)
-    print(f"  {codeflare_msg}")
-    if not codeflare_ok:
-        print(
-            "  WARNING: Could not update DataScienceCluster. You may need to set codeflare to Removed manually before the RHOAI upgrade."
-        )
-    print()
-
-    # Run pre-flight checks
+    # Run pre-flight checks before making any cluster modifications
     print("Running pre-upgrade checks...")
     print("-" * 60)
 
@@ -1733,6 +1624,16 @@ def pre_upgrade(
         print("All pre-upgrade checks passed.\n")
     else:
         print("Pre-upgrade checks completed with warnings.\n")
+
+    # Set codeflare to Removed in DataScienceCluster (only after all required checks pass)
+    print("Pre-upgrade step: Setting codeflare to Removed in DataScienceCluster...")
+    codeflare_ok, codeflare_msg = _set_dsc_codeflare_removed(api_client)
+    print(f"  {codeflare_msg}")
+    if not codeflare_ok:
+        print(
+            "  WARNING: Could not update DataScienceCluster. You may need to set codeflare to Removed manually before the RHOAI upgrade."
+        )
+    print()
 
     # Get clusters based on scope (before creating output directory)
     clusters = _get_clusters(api_instance, core_api, cluster_name, namespace)
