@@ -1179,9 +1179,15 @@ def _run_pre_upgrade_checks(api_client) -> List[Dict[str, any]]:
     # Permission checks for pre-upgrade
     permission_checks = [
         ("list", "namespaces", "", "List namespaces"),
+        ("get", "namespaces", "", "Get namespaces"),
         ("list", "rayclusters", "ray.io", "List RayClusters"),
         ("get", "rayclusters", "ray.io", "Get RayClusters"),
-        ("update", "rayclusters", "ray.io", "Update RayClusters"),
+        ("patch", "rayclusters", "ray.io", "Patch RayClusters"),
+        ("list", "routes", "route.openshift.io", "List Routes"),
+        ("delete", "routes", "route.openshift.io", "Delete Routes"),
+        ("list", "datascienceclusters", "datasciencecluster.opendatahub.io", "List DataScienceClusters"),
+        ("patch", "datascienceclusters", "datasciencecluster.opendatahub.io", "Patch DataScienceClusters"),
+        ("get", "customresourcedefinitions", "apiextensions.k8s.io", "Get CRDs"),
     ]
 
     all_permissions_ok = True
