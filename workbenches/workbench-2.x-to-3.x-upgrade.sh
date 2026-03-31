@@ -513,7 +513,7 @@ patch_workbench() {
         fi
     fi
 
-    echo "Patching notebook '$name' in namespace '$namespace'..."
+    echo "Patching workbench '$name' in namespace '$namespace'..."
 
     # Track workbenches in Kueue-managed namespaces for post-patch check
     if [ "$SKIP_STOP" = true ] && is_namespace_kueue_managed "$namespace"; then
@@ -603,7 +603,7 @@ cleanup_workbench() {
     local namespace="$2"
 
     echo "=========================================================="
-    echo " Starting cleanup for Notebook: $name"
+    echo " Starting cleanup for Workbench: $name"
     echo " Target Namespace:              $namespace"
     echo "=========================================================="
     echo "[Pre-check] Running verify checks before cleanup..."
@@ -833,7 +833,7 @@ verify_workbench() {
     local namespace="$2"
     local pass=true
 
-    echo "=== Verifying Notebook: $name in $namespace ==="
+    echo "=== Verifying Workbench: $name in $namespace ==="
 
     case "${VERIFY_PHASE:-migration}" in
         migration)
@@ -975,11 +975,11 @@ patch_kueue_label_workbench() {
         -o jsonpath='{.metadata.labels.kueue\.x-k8s\.io/queue-name}' 2>/dev/null)
 
     if [ -n "$queue_label" ]; then
-        echo "  Notebook '$name' in '$namespace' already has queue-name label: '$queue_label' — skipping."
+        echo "  Workbench '$name' in '$namespace' already has queue-name label: '$queue_label' — skipping."
         return 0
     fi
 
-    echo "  Patching notebook '$name' in '$namespace' with kueue queue-name label..."
+    echo "  Patching workbench '$name' in '$namespace' with kueue queue-name label..."
     oc label notebook "$name" -n "$namespace" \
         "kueue.x-k8s.io/queue-name=$QUEUE_NAME" --overwrite
 
@@ -1034,7 +1034,7 @@ list_workbench() {
         fi
     fi
 
-    echo "=== Notebook: $name  (namespace: $namespace) ==="
+    echo "=== Workbench: $name  (namespace: $namespace) ==="
     echo "  State:                   $state"
     echo "  inject-oauth annotation: ${inject_oauth:-<not set>}"
     echo "  inject-auth  annotation: ${inject_auth:-<not set>}"
@@ -1159,7 +1159,7 @@ list_all_workbenches() {
 
     echo ""
     echo "Summary:"
-    echo "  Total workbenches: $total"
+    echo "  Total workbenches:  $total"
     echo ""
     echo "  Migration status:"
     echo "    Legacy (2.x):     $legacy"
@@ -1184,7 +1184,7 @@ list_all_workbenches() {
     if [ "$invalid" -gt 0 ]; then
         echo "  ERROR:   $(pluralize_wb "$invalid") are in an invalid state — review manually."
         echo "           Run '$(basename "$0") verify --name <name> --namespace <namespace> --phase migration' to review the migration status."
-        echo "           Run '$(basename "$0") patch --name <name> --namespace <namespace>' to patch the notebook to the 3.x auth model."
+        echo "           Run '$(basename "$0") patch --name <name> --namespace <namespace>' to patch the workbench to the 3.x auth model."
     fi
     if [ "$legacy" -eq 0 ] && [ "$invalid" -eq 0 ]; then
         echo "  OK: All workbenches have been migrated."
@@ -1452,11 +1452,10 @@ case "$COMMAND" in
                 echo ""
                 echo "=== Skipping cleanup — no workbenches were patched ==="
             else
-                local patched_count
                 patched_count=$(wc -l < "$PATCHED_WORKBENCHES" | tr -d ' ')
                 echo "=== Running cleanup for $(pluralize_wb "$patched_count") (--with-cleanup) ==="
                 confirm_cleanup "$patched_count"
-                local cleanup_failed=0
+                cleanup_failed=0
                 while read -r wb_name wb_namespace; do
                     if ! cleanup_workbench "$wb_name" "$wb_namespace"; then
                         cleanup_failed=$((cleanup_failed + 1))
