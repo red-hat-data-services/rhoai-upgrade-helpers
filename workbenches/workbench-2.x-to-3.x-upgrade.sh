@@ -115,6 +115,20 @@ EOF
 }
 
 # ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+
+# Return "<count> workbench" or "<count> workbenches" based on count.
+#   $1 = count
+pluralize_wb() {
+    if [ "$1" -eq 1 ]; then
+        echo "$1 workbench"
+    else
+        echo "$1 workbenches"
+    fi
+}
+
+# ──────────────────────────────────────────────
 # Confirmation prompts
 # ──────────────────────────────────────────────
 
@@ -161,6 +175,7 @@ patch_exit_handler() {
         rm -f "$STOPPED_BY_SCRIPT"
     fi
     rm -f "${KUEUE_WORKBENCHES_TO_CHECK:-}"
+    rm -f "${PATCHED_WORKBENCHES:-}"
     return "$exit_code"
 }
 
@@ -242,20 +257,20 @@ EOF
     case "$MODE" in
         all)
             if [ "$ONLY_STOPPED" = true ]; then
-                echo "  Target:  ALL STOPPED notebooks in the cluster"
+                echo "  Target:  ALL STOPPED workbenches in the cluster"
             else
-                echo "  Target:  ALL notebooks in the cluster"
+                echo "  Target:  ALL workbenches in the cluster"
             fi
             ;;
         namespace)
             if [ "$ONLY_STOPPED" = true ]; then
-                echo "  Target:  ALL STOPPED notebooks in namespace '$NAMESPACE'"
+                echo "  Target:  ALL STOPPED workbenches in namespace '$NAMESPACE'"
             else
-                echo "  Target:  ALL notebooks in namespace '$NAMESPACE'"
+                echo "  Target:  ALL workbenches in namespace '$NAMESPACE'"
             fi
             ;;
         single)
-            echo "  Target:  notebook '$NAME' in namespace '$NAMESPACE'"
+            echo "  Target:  workbench '$NAME' in namespace '$NAMESPACE'"
             ;;
     esac
     ask_confirmation
@@ -263,6 +278,7 @@ EOF
 
 # Confirmation gate for the cleanup command.
 confirm_cleanup() {
+    local patched_count="${1:-}"
     cat <<'EOF'
 
 ╔════════════════════════════════════════════════════════════════╗
@@ -277,17 +293,21 @@ confirm_cleanup() {
 ╚════════════════════════════════════════════════════════════════╝
 EOF
     print_cluster_info
-    case "$MODE" in
-        all)
-            echo "  Target:  ALL notebooks in the cluster"
-            ;;
-        namespace)
-            echo "  Target:  ALL notebooks in namespace '$NAMESPACE'"
-            ;;
-        single)
-            echo "  Target:  notebook '$NAME' in namespace '$NAMESPACE'"
-            ;;
-    esac
+    if [ -n "$patched_count" ]; then
+        echo "  Target:  $(pluralize_wb "$patched_count") that were patched above"
+    else
+        case "$MODE" in
+            all)
+                echo "  Target:  ALL workbenches in the cluster"
+                ;;
+            namespace)
+                echo "  Target:  ALL workbenches in namespace '$NAMESPACE'"
+                ;;
+            single)
+                echo "  Target:  workbench '$NAME' in namespace '$NAMESPACE'"
+                ;;
+        esac
+    fi
     ask_confirmation
 }
 
@@ -568,6 +588,11 @@ patch_workbench() {
         && oc delete statefulset -n "$namespace" "$name"
 
     echo "  Patch applied for '$name'."
+
+    # Track successfully patched workbenches (used by --with-cleanup)
+    if [ -n "${PATCHED_WORKBENCHES:-}" ]; then
+        echo "$name $namespace" >> "$PATCHED_WORKBENCHES"
+    fi
 }
 
 # Remove stale OAuth-related resources for a single notebook.
@@ -1051,12 +1076,12 @@ list_all_workbenches() {
     total=$(echo "$json" | jq '.items | length')
 
     if [ "$total" -eq 0 ]; then
-        echo "No notebooks found on the cluster."
+        echo "No workbenches found on the cluster."
         return 0
     fi
 
     echo ""
-    echo "Scanning all notebooks on the cluster..."
+    echo "Scanning all workbenches on the cluster..."
     echo ""
     printf "  %-40s %-30s %-12s %s\n" "NAME" "NAMESPACE" "STATE" "STATUS"
     printf "  %-40s %-30s %-12s %s\n" "----" "---------" "-----" "------"
@@ -1134,7 +1159,7 @@ list_all_workbenches() {
 
     echo ""
     echo "Summary:"
-    echo "  Total notebooks:  $total"
+    echo "  Total workbenches: $total"
     echo ""
     echo "  Migration status:"
     echo "    Legacy (2.x):     $legacy"
@@ -1150,19 +1175,19 @@ list_all_workbenches() {
     echo ""
 
     if [ "$legacy" -gt 0 ]; then
-        echo "  WARNING: $legacy notebook(s) still need migration (LEGACY)."
+        echo "  WARNING: $(pluralize_wb "$legacy") still need migration (LEGACY)."
     fi
     if [ "$unreconciled" -gt 0 ]; then
-        echo "  ERROR:   $unreconciled notebook(s) are UNRECONCILED — inject-auth annotation is set but"
+        echo "  ERROR:   $(pluralize_wb "$unreconciled") are UNRECONCILED — inject-auth annotation is set but"
         echo "           oauth-proxy sidecar is still present. Check notebook controller logs."
     fi
     if [ "$invalid" -gt 0 ]; then
-        echo "  ERROR:   $invalid notebook(s) are in an invalid state — review manually."
+        echo "  ERROR:   $(pluralize_wb "$invalid") are in an invalid state — review manually."
         echo "           Run '$(basename "$0") verify --name <name> --namespace <namespace> --phase migration' to review the migration status."
         echo "           Run '$(basename "$0") patch --name <name> --namespace <namespace>' to patch the notebook to the 3.x auth model."
     fi
     if [ "$legacy" -eq 0 ] && [ "$invalid" -eq 0 ]; then
-        echo "  OK: All notebooks have been migrated."
+        echo "  OK: All workbenches have been migrated."
     fi
     echo ""
 }
@@ -1188,12 +1213,12 @@ process_all() {
 
     if [ "$failed" -gt 0 ]; then
         echo ""
-        echo "Processed $total notebook(s): $failed failed."
+        echo "Processed $(pluralize_wb "$total"): $failed failed."
         return 1
     fi
 
     echo ""
-    echo "Processed $total notebook(s): all succeeded."
+    echo "Processed $(pluralize_wb "$total"): all succeeded."
     return 0
 }
 
@@ -1218,18 +1243,18 @@ process_namespace() {
     )
 
     if [ "$total" -eq 0 ]; then
-        echo "No notebooks found in namespace '$namespace'."
+        echo "No workbenches found in namespace '$namespace'."
         return 0
     fi
 
     if [ "$failed" -gt 0 ]; then
         echo ""
-        echo "Processed $total notebook(s) in namespace '$namespace': $failed failed."
+        echo "Processed $(pluralize_wb "$total") in namespace '$namespace': $failed failed."
         return 1
     fi
 
     echo ""
-    echo "Processed $total notebook(s) in namespace '$namespace': all succeeded."
+    echo "Processed $(pluralize_wb "$total") in namespace '$namespace': all succeeded."
     return 0
 }
 
@@ -1379,11 +1404,13 @@ case "$COMMAND" in
         STOPPED_BY_SCRIPT=$(mktemp)
         # Temp file that tracks workbenches in Kueue-managed namespaces (for post-patch check).
         KUEUE_WORKBENCHES_TO_CHECK=$(mktemp)
+        # Temp file that tracks workbenches that were actually patched (for --with-cleanup).
+        PATCHED_WORKBENCHES=$(mktemp)
         trap 'patch_exit_handler' EXIT
 
         if [ "$SKIP_STOP" = false ] && [ "$ONLY_STOPPED" = false ]; then
             echo ""
-            echo "=== Stopping any still-running workbench(es) before patching ==="
+            echo "=== Stopping any still-running workbenches before patching ==="
             case "$MODE" in
                 all)
                     process_all stop_workbench
@@ -1421,25 +1448,34 @@ case "$COMMAND" in
         fi
 
         if [ "$WITH_CLEANUP" = true ]; then
-            echo "=== Running cleanup after patch (--with-cleanup) ==="
-            confirm_cleanup
-            case "$MODE" in
-                all)
-                    process_all cleanup_workbench
-                    ;;
-                namespace)
-                    process_namespace cleanup_workbench "$NAMESPACE"
-                    ;;
-                single)
-                    cleanup_workbench "$NAME" "$NAMESPACE"
-                    ;;
-            esac
+            if [ ! -s "$PATCHED_WORKBENCHES" ]; then
+                echo ""
+                echo "=== Skipping cleanup — no workbenches were patched ==="
+            else
+                local patched_count
+                patched_count=$(wc -l < "$PATCHED_WORKBENCHES" | tr -d ' ')
+                echo "=== Running cleanup for $(pluralize_wb "$patched_count") (--with-cleanup) ==="
+                confirm_cleanup "$patched_count"
+                local cleanup_failed=0
+                while read -r wb_name wb_namespace; do
+                    if ! cleanup_workbench "$wb_name" "$wb_namespace"; then
+                        cleanup_failed=$((cleanup_failed + 1))
+                    fi
+                done < "$PATCHED_WORKBENCHES"
+                if [ "$cleanup_failed" -gt 0 ]; then
+                    echo ""
+                    echo "Cleanup: $cleanup_failed of $(pluralize_wb "$patched_count") had failures."
+                else
+                    echo ""
+                    echo "Cleanup: all $(pluralize_wb "$patched_count") completed successfully."
+                fi
+            fi
         fi
 
         # Check for pods stuck in Terminating state in Kueue-managed namespaces
         check_kueue_pods_terminating
 
-        rm -f "$STOPPED_BY_SCRIPT" "$KUEUE_WORKBENCHES_TO_CHECK"
+        rm -f "$STOPPED_BY_SCRIPT" "$KUEUE_WORKBENCHES_TO_CHECK" "$PATCHED_WORKBENCHES"
         trap - EXIT
         ;;
     cleanup)
