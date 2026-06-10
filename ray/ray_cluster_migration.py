@@ -83,6 +83,24 @@ from kubernetes import client, config
 from kubernetes.dynamic import DynamicClient
 from kubernetes.client.rest import ApiException
 
+# Same env as codeflare-sdk tests/upgrade/migration_support.py (default: suppress).
+_SUPPRESS_TLS_WARNINGS_ENV = "RAY_CLUSTER_MIGRATION_SUPPRESS_TLS_WARNINGS"
+
+
+def _configure_tls_warning_suppression() -> None:
+    value = os.environ.get(_SUPPRESS_TLS_WARNINGS_ENV, "1").strip().lower()
+    if value in ("0", "false", "no", "off"):
+        return
+    try:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
+
+_configure_tls_warning_suppression()
+
 RHOAI_UPGRADE_BACKUP_DIR = os.environ.get("RHOAI_UPGRADE_BACKUP_DIR", "/tmp/rhoai-upgrade-backup")
 
 # Field manager identifier for server-side apply
@@ -293,17 +311,16 @@ def _remove_pre_upgrade_backup_annotation(
             plural="rayclusters",
             name=name,
         )
-        annotations = dict(rc.get("metadata", {}).get("annotations") or {})
+        annotations = rc.get("metadata", {}).get("annotations") or {}
         if PRE_UPGRADE_BACKUP_ANNOTATION not in annotations:
             return
-        del annotations[PRE_UPGRADE_BACKUP_ANNOTATION]
         api_instance.patch_namespaced_custom_object(
             group="ray.io",
             version="v1",
             namespace=namespace,
             plural="rayclusters",
             name=name,
-            body={"metadata": {"annotations": annotations}},
+            body={"metadata": {"annotations": {PRE_UPGRADE_BACKUP_ANNOTATION: None}}},
         )
     except Exception as e:
         print(f"  Warning: could not remove pre-upgrade backup annotation from {name}: {e}")
@@ -356,6 +373,99 @@ def _is_route_owned_by_ray_cluster(route: dict) -> bool:
                 (ref.get("apiVersion") == "ray.io/v1" or
                  (ref.get("apiVersion") or "").endswith("ray.io/v1"))):
             return True
+    return False
+
+
+def _collect_ray_owned_routes(
+    api_instance, namespaces: List[str]
+) -> List[Tuple[str, str]]:
+    """
+    List OpenShift Routes in the given namespaces that have an ownerReference
+    to a RayCluster (ray.io/v1).
+
+    Returns:
+        [(namespace, route_name), ...]
+    """
+    owned = []
+    for ns in namespaces:
+        if not ns:
+            continue
+        try:
+            resp = api_instance.list_namespaced_custom_object(
+                group="route.openshift.io",
+                version="v1",
+                namespace=ns,
+                plural="routes",
+            )
+        except ApiException as e:
+            if e.status == 404 or "Unknown" in (e.reason or ""):
+                continue
+            if e.status == 403:
+                continue
+            raise
+        for route in resp.get("items", []):
+            if not _is_route_owned_by_ray_cluster(route):
+                continue
+            name = route.get("metadata", {}).get("name")
+            if name:
+                owned.append((ns, name))
+    return owned
+
+
+def _wait_for_no_ray_owned_routes(
+    api_instance,
+    namespaces: List[str],
+    timeout_seconds: int = 120,
+    poll_interval: int = 3,
+) -> bool:
+    """
+    Poll until no Ray-owned OpenShift Routes remain in the given namespaces.
+    Re-deletes routes if the operator recreates them while enableIngress settles.
+
+    Returns:
+        True if no Ray-owned routes remain, False on timeout.
+    """
+    elapsed = 0
+    logged_waiting = False
+
+    while elapsed < timeout_seconds:
+        remaining = _collect_ray_owned_routes(api_instance, namespaces)
+        if not remaining:
+            if logged_waiting:
+                print("  Ray-owned Routes removed.")
+            return True
+
+        if not logged_waiting:
+            print(
+                "Pre-upgrade step: Waiting for Ray-owned Routes to be removed..."
+            )
+            logged_waiting = True
+
+        for ns, name in remaining:
+            try:
+                api_instance.delete_namespaced_custom_object(
+                    group="route.openshift.io",
+                    version="v1",
+                    namespace=ns,
+                    plural="routes",
+                    name=name,
+                )
+            except ApiException as e:
+                if e.status != 404:
+                    print(
+                        f"  Warning: could not delete Route {ns}/{name}: {e.reason}"
+                    )
+
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    remaining = _collect_ray_owned_routes(api_instance, namespaces)
+    print(
+        f"  Warning: timed out after {timeout_seconds}s waiting for Ray-owned "
+        "Routes to be removed:"
+    )
+    for ns, name in remaining:
+        print(f"    - {ns}/{name}")
     return False
 
 
@@ -1651,9 +1761,23 @@ def pre_upgrade(
         )
         return []
 
-    # Remove OpenShift Routes that are owned by a RayCluster (from enableIngress);
+    namespaces_with_ray = list(
+        {rc.get("metadata", {}).get("namespace") for rc in clusters}
+    )
+
+    # Disable enableIngress before deleting Routes so KubeRay does not recreate them
+    # during the backup phase on a slow/fresh cluster.
+    print(
+        "Pre-upgrade step: Setting enableIngress to false on RayClusters..."
+    )
+    for rc in clusters:
+        name = rc.get("metadata", {}).get("name", "unknown")
+        ns = rc.get("metadata", {}).get("namespace", "unknown")
+        _set_enable_ingress_false(api_instance, name, ns)
+    print()
+
+    # Remove OpenShift Routes owned by RayClusters (from enableIngress);
     # post-upgrade uses Gateway API instead.
-    namespaces_with_ray = list({rc.get("metadata", {}).get("namespace") for rc in clusters})
     try:
         n_removed, removed_routes = _delete_routes_owned_by_ray_clusters(
             api_instance, namespaces_with_ray
@@ -1666,6 +1790,9 @@ def pre_upgrade(
     except Exception as e:
         print(f"  Warning: could not remove Routes owned by RayClusters: {e}")
         print()
+
+    _wait_for_no_ray_owned_routes(api_instance, namespaces_with_ray)
+    print()
 
     print(f"Backup files will be saved to: {output_dir}")
     print()
